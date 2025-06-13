@@ -13,12 +13,13 @@ This API requires numerous R packages. You can install them from CRAN and Biocon
 **CRAN Packages:**
 ```R
 install.packages(c(
-  "plumber", "Morpho", "ddsPLS", "Jovid", "dplyr", "dbplyr", "future", 
+  "plumber", "Morpho", "ddsPLS", "dplyr", "dbplyr", "future", 
   "promises", "abind", "devtools", "rgl", "ggplot2", "cmocean", "pals",
   "RColorBrewer", "plot3D", "Rvcg", "geomorph", "shapes", "foreach",
   "parallel", "doParallel", "biomaRt", "biomartr", "plinkFile", "LDlinkR",
   "paran", "gmodels", "DBI", "RSQLite"
 ))
+devtools::install_github("https://github.com/J0vid/Jovid")
 ```
 
 **Bioconductor Packages:**
