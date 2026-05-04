@@ -6,6 +6,7 @@ This API implements the `ddsPLS` (discriminant and de-sparsified PLS) method to 
 
 To test it with our web GUI go to [Hallgrimsson Lab MGP](https://hallgrimssonlab.ca/MGPShow)
 
+![Screen capture](./Screenshot%20from%202026-05-04%2014-52-10.png)
 
 ## 1. Setup & Dependencies
 
