@@ -12,12 +12,11 @@ library(abind)
 future::plan("multicore")
 
 library(devtools)
-library(rgl)
 library(ggplot2)
 library(cmocean)
 library(pals)
 library(RColorBrewer)
-library(plot3D)
+
 library(Rvcg)
 library(Morpho)
 library(geomorph)
@@ -35,9 +34,17 @@ library(plinkFile)
 library(LDlinkR)
 library(paran)
 library(gmodels)
+library(jsonlite)
 
 library(DBI)
 library(RSQLite)
+
+DEBUG <- FALSE
+
+if(DEBUG){
+  library(plot3D)
+  library(rgl)
+}
 
 options("plumber.port" = 6234)
 
@@ -50,6 +57,7 @@ mmusculusEnsembl <- loadDb(file="~/Documents/MGP/jovid/MGP_API/ensemble.sqlite")
 load("~/Documents/MGP/jovid/MGP_API/offline_data_no_biggie.Rdata")
 load("~/Documents/MGP/jovid/MGP_API/cached.results.Rdata")
 load("~/Documents/MGP/jovid/MGP_API/Mouse_Data/MGP_landmarks_mus.Rdata")
+load("~/Documents/MGP/jovid/MGP_API/Mouse_Data/MGP_landmarks_mus_mutant.Rdata")
 
 # New code using DBI/RSQLite:
 DO_probs_DB <- dbConnect(RSQLite::SQLite(), "~/Documents/MGP/jovid/MGP_API/MGP_genotypes.sqlite")
@@ -67,6 +75,31 @@ first_marker <- marker_tables[1]
 num_subjects <- dbGetQuery(DO_probs_DB_cleaner, paste0("SELECT COUNT(*) FROM '", first_marker, "'"))[[1]]
 cat("Number of subjects for marker", first_marker, ":", num_subjects, "\n")
 
+
+## ── offline annotation tables ─────────────────────────────────────────
+base_path <- "~/Documents/MGP/jovid/MGP_API/humanGeneDBs"
+
+load(file.path(base_path, "ensembl_gene_coords_GRCh37.RData"))   # object coords
+ENSEMBL_COORDS_HUMAN <- coords ; rm(coords)
+
+load(file.path(base_path, "symbol2ensembl_hs.RData"))            # SYMBOL2ENSEMBL
+SYMBOL2ENSEMBL_HUMAN <- SYMBOL2ENSEMBL ; rm(SYMBOL2ENSEMBL)
+
+load(file.path(base_path, "ensembl2symbol_hs.RData"))            # ENSEMBL2SYMBOL
+ENSEMBL2SYMBOL_HUMAN <- ENSEMBL2SYMBOL ; rm(ENSEMBL2SYMBOL)
+
+load(file.path(base_path, "go2symbol_hs.RData"))                 # GO2SYMBOL
+GO2SYMBOL_HUMAN <- GO2SYMBOL ; rm(GO2SYMBOL)
+
+## ── helper mappers (purely local look-ups) ────────────────────────────
+map_symbol_to_ensembl <- function(sym)
+  subset(SYMBOL2ENSEMBL_HUMAN, toupper(SYMBOL) %in% toupper(sym))
+
+map_ensembl_to_symbol <- function(ens)
+  subset(ENSEMBL2SYMBOL_HUMAN, ENSEMBL %in% ens)
+
+map_go_to_symbol <- function(go)
+  subset(GO2SYMBOL_HUMAN, GO %in% go, select = c("ENSEMBL","SYMBOL"))
 
 
 
@@ -237,6 +270,29 @@ pheno_names_mouse <- list(
   # Add more elements as needed
 )
 
+# Create a list with the names of the phenotype groups
+pheno_names_mouse_groups <- list(
+  "Manual" = c("Y"),
+  "Automated" = c(
+    "A_lm_raw",
+    "A_lm_gen",
+    "F_lm_gen",
+    "M_lm_gen",
+    "A_lm_gen_sex",
+    "A_lm_gen_sex_size",
+    "A_lm_gen_size",
+    "F_lm_gen_size",
+    "M_lm_gen_size",
+    "A_lm",
+    "F_lm",
+    "M_lm")
+  # Add more elements as needed
+)
+
+pheno_names_mouse_mutants <- list(
+  "Manual" = c("mutant.db", "mutant.lms"),
+  "Automated" = c("auto.mutant.db", "auto.mutant.lms")
+)
 
 pheno_names_human <- list(
   "YHuman",
@@ -311,35 +367,106 @@ get_curated_gene_list <- function() {
   return(curated_gene_list)
 }
 
-get_curated_gene_list_human <- function() {
-  # Check if the curated gene list is already in memory
-  if (!exists("curated_gene_list_human")) {
-    # If not, compile the gene list
-    keys <- keys(org.Hs.eg.db)
-    all_genes <- unique(na.omit(AnnotationDbi::select(org.Hs.eg.db, keys, columns = c("ENSEMBL", "SYMBOL"), keytype = "ENTREZID")))
-    
-    # Create rangenes.gene2symbol
-    all_genes <- all_genes[, c("SYMBOL", "ENSEMBL")]
-    
-    # Remove bad genes
-    bad_genes <- read.csv("~/Documents/MGP/jovid/MGP_API/bad_genes_human.csv", stringsAsFactors = FALSE)
-    if(nrow(bad_genes) > 0){
-      all_genes <- remove_rows(all_genes, bad_genes)
-    }
-    
-    # Save the curated gene list in memory
-    curated_gene_list_human <- all_genes
-    
-    # Group by SYMBOL and take the first occurrence of each group
-    curated_gene_list_human <- curated_gene_list_human %>%
-      group_by(SYMBOL) %>%
-      slice(1) %>%
-      ungroup()
+
+
+get_curated_gene_list_human <- function(pheno,
+                                        batch_size    = 500,
+                                        force_rebuild = FALSE,
+                                        cache_env     = .GlobalEnv) {
+
+  ## ----- helper ---------------------------------------------------- ##
+  clr           <- function(code, txt) paste0("\033[", code, "m", txt, "\033[0m")
+  json_filename <- switch(pheno,
+                          "YHuman"          = "~/Documents/MGP/jovid/MGP_API/pitt_whitelist.json",
+                          "YHumanDense"     = "~/Documents/MGP/jovid/MGP_API/pitt_whitelist.json",
+                          "YHumanTANZ"      = "~/Documents/MGP/jovid/MGP_API/tanz_whitelist.json",
+                          "YHumanTANZDense" = "~/Documents/MGP/jovid/MGP_API/tanz_whitelist.json",
+                          NULL)
+  cache_var     <- paste0("curated_gene_list_human_", ifelse(is.null(pheno),"default",pheno))
+
+
+  ## ----- quick-load ------------------------------------------------ ##
+  if (!force_rebuild && exists(cache_var, envir = cache_env))
+    return(get(cache_var, envir = cache_env))
+
+  if (!force_rebuild && !is.null(json_filename) && file.exists(json_filename)) {
+    cat(clr(32,paste("Loading curated list from",basename(json_filename))),"\n")
+    js  <- jsonlite::fromJSON(json_filename)
+    res <- data.frame(SYMBOL=js$SYMBOL, ENSEMBL=js$ENSEMBL, stringsAsFactors=FALSE)
+    assign(cache_var, res, envir = cache_env)
+    return(res)
   }
-  
-  # Return the curated gene list
-  return(curated_gene_list_human)
+
+
+  ## ----- build from scratch --------------------------------------- ##
+  cat(clr(33,"Rebuilding curated gene list – chunked mode"),"\n")
+
+  # dummy shape matrix (big enough → sub-setting never fails)
+  dummy_Y <- matrix(0, nrow = 20000, ncol = 2)
+
+  all_syms   <- unique(SYMBOL2ENSEMBL_HUMAN$SYMBOL)
+  good_syms  <- character(0)
+
+  batches <- split(all_syms, ceiling(seq_along(all_syms)/batch_size))
+  pb <- txtProgressBar(min = 0, max = length(batches), style = 3)
+
+  start_time <- Sys.time()  # Record the start time
+
+  for (i in seq_along(batches)) {
+    batch <- batches[[i]]
+
+    batch_ok <- tryCatch({
+      res <- getHumanGenomeX_curate(GOterm = batch, pheno = pheno)
+
+      survived <- unlist(res)
+      # survived must be present in batch to be considered survived
+      survived <- survived[survived %in% batch]
+      good_syms <- c(good_syms, survived)
+      TRUE
+    }, error = function(e) { FALSE })
+
+    setTxtProgressBar(pb, i)
+
+    # Estimate time remaining
+    elapsed_time <- Sys.time() - start_time
+    avg_time_per_batch <- elapsed_time / i
+    batches_left <- length(batches) - i
+    estimated_remaining_time <- avg_time_per_batch * batches_left
+    cat("\nProcessed", i*batch_size, "out of", length(all_syms), "genes - (survived:", length(good_syms), ")\n")
+    cat("\nEstimated time remaining:", round(estimated_remaining_time, 2), "seconds\n")
+  }
+  close(pb)
+
+  good_syms <- unique(good_syms)
+  cat(clr(32, paste(length(good_syms),"symbols passed the full pipeline")),"\n")
+
+
+  ## ----- SYMBOL → ENSEMBL mapping --------------------------------- ##
+  curated <- SYMBOL2ENSEMBL_HUMAN[SYMBOL2ENSEMBL_HUMAN$SYMBOL %in% good_syms, ]
+  #curated <- unique(na.omit(AnnotationDbi::select(
+  #             org.Hs.eg.db,
+  #              keys    = good_syms,
+  #              columns = c("SYMBOL","ENSEMBL"),
+  #              keytype = "SYMBOL")))
+
+
+  ## ----- save + cache --------------------------------------------- ##
+  if (!is.null(json_filename)) {
+    jsonlite::write_json(
+      list(creation_date = Sys.time(),
+           pheno         = pheno,
+           total_genes   = nrow(curated),
+           SYMBOL        = curated$SYMBOL,
+           ENSEMBL       = curated$ENSEMBL),
+      json_filename, pretty = TRUE)
+    cat(clr(32,paste("Saved curated list to",basename(json_filename))),"\n")
+  }
+
+  assign(cache_var, curated, envir = cache_env)
+  curated    # final value returned
 }
+
+
 
 filter_bad_genes <- function(original_genes) {
   
@@ -482,8 +609,84 @@ standardizePCA <- function(Yshapes, use_standardized_PCA, x) {
   }
 }
 
+
+# ---------------------------------------------------------------------
+# Fast gene-filter for the curation step only
+# ---------------------------------------------------------------------
+getHumanGenomeX_curate <- function(GOterm,
+                                   pheno,
+                                   window    = 0,
+                                   cache_env = .GlobalEnv) {
+
+  ## ---------- genotype BIM (cached) ---------------------------------
+  mntpath <- "~/Documents/MGP/jovid/MGP_API/humanMGP-master/R/"
+  loadpath2 <- paste0(mntpath, "Genetics/")
+  bfile <- if (pheno %in% c("YHuman", "YHumanDense"))
+             paste0(loadpath2, "PITT/Marazita_imputed_qc_prune_rmrel")
+           else
+             paste0(loadpath2, "TANZ/Spritz_imputed_qc_prune_rmrel")
+
+  bim_var <- paste0("bim_cache_", pheno)
+  if (!exists(bim_var, envir = cache_env))
+    assign(bim_var, readBIM(bfile), envir = cache_env)
+  geno.bim <- get(bim_var, envir = cache_env)
+
+
+
+  ## ---------- SYMBOL ⇢ ENSEMBL --------------------------------------
+  map <- SYMBOL2ENSEMBL_HUMAN
+  sel <- map[map$SYMBOL %in% GOterm | map$ENSEMBL %in% GOterm, ]
+  if (nrow(sel) == 0) stop("No SYMBOL/ENSEMBL match found")
+
+
+
+  ## ---------- coordinates -------------------------------------------
+  coords <- ENSEMBL_COORDS_HUMAN[
+             ENSEMBL_COORDS_HUMAN$ensembl_gene_id %in% sel$ENSEMBL, ]
+
+
+
+  # clean & unify chromosome names
+  coords$chromosome_name <- gsub("HSCHR", "", coords$chromosome_name)
+  coords$chromosome_name <- sub("_.*", "", coords$chromosome_name)
+  coords$chromosome_name <- gsub("X", "23", coords$chromosome_name)
+  coords$chromosome_name <- gsub("Y", "24", coords$chromosome_name)
+  coords <- coords[!grepl("HG", coords$chromosome_name), ]
+
+
+
+  ## ---------- SNP presence test -------------------------------------
+  survived <- character(0)
+  for (g in unique(sel$SYMBOL)) {
+    ens <- sel$ENSEMBL[match(g, sel$SYMBOL)]
+    cc  <- coords[coords$ensembl_gene_id == ens, ]
+    if (nrow(cc) == 0) next
+    
+    # --- handle chromosome conversion (consistent with existing code style) ---
+    chr <- suppressWarnings(as.numeric(cc$chromosome_name[1]))
+    if (is.na(chr)) next  # Skip genes on non-standard chromosomes
+
+    # --- collapse all transcripts of the gene to a single range ----------
+    gene_start <- min(cc$transcript_start, na.rm = TRUE)
+    gene_end   <- max(cc$transcript_end,   na.rm = TRUE)
+
+    # --- SNP-presence test (no vector recycling warnings) ----------------
+    hit <- any(with(geno.bim[geno.bim$chr == chr, ],
+                    bps > (gene_start - window) &
+                    bps < (gene_end   + window)))
+    if (hit) survived <- c(survived, g)
+  }
+  survived <- unique(survived)
+
+
+  as.list(survived)
+}
+
+
+
 # Extract the human genes of interest and reduce them with PCA, returns X
-getHumanGenomeX <- function(GOterm, gene_type, pheno, Yshapes){
+
+getHumanGenomeX <- function(GOterm, gene_type, pheno, Yshapes, single_match=FALSE, cache_env = .GlobalEnv){
   
   # manual mode
   # GOterm = selection.vector
@@ -511,20 +714,39 @@ getHumanGenomeX <- function(GOterm, gene_type, pheno, Yshapes){
     bfile = paste(loadpath2,"TANZ/Spritz_imputed_qc_prune_rmrel",sep="") 
     pheno.id = pheno.id.human.TANZ
   }
-  geno.full.bim = readBIM(bfile)
-  geno.full.fam =  readFAM(bfile)
+  
+  ## ---------- genotype BIM (cached) ---------------------------------
+  bim_var <- paste0("bim_cache_", pheno)
+  if (!exists(bim_var, envir = cache_env))
+    assign(bim_var, readBIM(bfile), envir = cache_env)
+  geno.full.bim <- get(bim_var, envir = cache_env)
+
+
+  #geno.full.fam =  readFAM(bfile)
   GRCh = 37
   
   
   ## GENE/GO SEARCH TERM ####
   cat("\033[33m", "=== Match Genes to Search Term", "\033[0m", "\n")
-  # List all IDs of GO terms available in org.Hs object, and reduce to biological processes
-  GO_ID = toTable(org.Hs.egGO)
-  GO_ID = unique(GO_ID$go_id[GO_ID$Ontology == "BP"])
-  # Match GO IDs with process names
-  GO_all = toTable(GOTERM)
-  GO_BP = GO_all[GO_all$Ontology == "BP",]
-  GO_BP = GO_BP[match(GO_ID,GO_BP$go_id),]
+  if (sum(tolower(GOterm) %in% tolower(GO2SYMBOL_HUMAN$GO_TERM) | tolower(GOterm) %in% tolower(GO2SYMBOL_HUMAN$GO))) {
+    # Use offline GO database
+    go_matches <- GO2SYMBOL_HUMAN[tolower(GO2SYMBOL_HUMAN$GO_TERM) %in% tolower(GOterm) | 
+                                  tolower(GO2SYMBOL_HUMAN$GO) %in% tolower(GOterm), ]
+    go2symbol <- data.frame(
+      ENSEMBL = go_matches$ENSEMBL,
+      SYMBOL = go_matches$SYMBOL,
+      stringsAsFactors = FALSE
+    )
+    go2symbol <- unique(na.omit(go2symbol))
+  }
+
+  # # List all IDs of GO terms available in org.Hs object, and reduce to biological processes
+  # GO_ID = toTable(org.Hs.egGO)
+  # GO_ID = unique(GO_ID$go_id[GO_ID$Ontology == "BP"])
+  # # Match GO IDs with process names
+  # GO_all = toTable(GOTERM)
+  # GO_BP = GO_all[GO_all$Ontology == "BP",]
+  # GO_BP = GO_BP[match(GO_ID,GO_BP$go_id),]
   
   # # ---------------------save CSV of human ensembl and GO dbs---------------------------
   # # Initialize a new column for the number of genes
@@ -584,60 +806,125 @@ getHumanGenomeX <- function(GOterm, gene_type, pheno, Yshapes){
   # write.csv(unique_data, file = "~/Documents/MGP/jovid/MGP_API/humanEnsembl.csv", row.names = FALSE)
   # ------------------------------------------------
   
-  # List all gene names available in org.Hs object
-  GENE_all = toTable(org.Hs.egSYMBOL)
-  # Match ensembl IDs with gene names
-  ENSG_all = toTable(org.Hs.egENSEMBL)
-  ind = match(ENSG_all$gene_id,GENE_all$gene_id)
-  GENE_all$ensembl_id = ""; GENE_all$ensembl_id[ind] = ENSG_all$ensembl_id
-  
-  # Biological process (NAME / ID)
-  if (sum(tolower(GOterm) %in% tolower(GO_BP$Term) | tolower(GOterm) %in% tolower(GO_BP$go_id))) {
-    ind1 = match(tolower(GOterm),tolower(GO_BP$Term))
-    ind2 = match(tolower(GOterm),tolower(GO_BP$go_id))
-    ind = c(ind1,ind2); ind = ind[!is.na(ind)]
+
+  # Biological process (NAME / ID) - direct offline lookup
+  if (sum(tolower(GOterm) %in% tolower(GO2SYMBOL_HUMAN$GO_TERM) | tolower(GOterm) %in% tolower(GO2SYMBOL_HUMAN$GO))) {
+    # Use offline GO database directly
+    go_matches <- GO2SYMBOL_HUMAN[tolower(GO2SYMBOL_HUMAN$GO_TERM) %in% tolower(GOterm) | 
+                                  tolower(GO2SYMBOL_HUMAN$GO) %in% tolower(GOterm), ]
+    go2symbol <- data.frame(
+      ENSEMBL = go_matches$ENSEMBL,
+      SYMBOL = go_matches$SYMBOL,
+      stringsAsFactors = FALSE
+    )
+    go2symbol <- unique(na.omit(go2symbol))
+  # Gene (NAME / ID) - FAST BATCH VERSION
+  } else {
     
-    go_id = GO_BP$go_id[ind]
-    go2symbol = unique(na.omit(AnnotationDbi::select(org.Hs.eg.db, keys = go_id, columns = c("ENSEMBL", "SYMBOL"), keytype = "GO")[,-2:-3]))
+    # Pre-categorize genes using offline databases
+    symbol_genes = GOterm[toupper(GOterm) %in% toupper(SYMBOL2ENSEMBL_HUMAN$SYMBOL)]
+    ensembl_genes = GOterm[toupper(GOterm) %in% toupper(SYMBOL2ENSEMBL_HUMAN$ENSEMBL)]
     
-    # Gene (NAME / ID)
-  } else if (sum(toupper(GOterm) %in% toupper(GENE_all$symbol) | toupper(GOterm) %in% toupper(GENE_all$ensembl_id))) {   
-    ind1 = match(toupper(GOterm),toupper(GENE_all$symbol))
-    ind2 = match(toupper(GOterm),toupper(GENE_all$ensembl_id))
-    ind = ind1; ind[is.na(ind1)] = ind2[is.na(ind1)]
+    # Batch queries (only 2 total queries max)
+    all_results = data.frame()
     
-    go2symbol = unique(na.omit(AnnotationDbi::select(org.Hs.eg.db, keys = GENE_all$symbol[ind[!is.na(ind)]], columns = c("ENSEMBL", "SYMBOL"), keytype = "SYMBOL")))
+    # Function to perform batch querying and mapping
+    perform_batch_query <- function(genes, keytype, column_names) {
+      if (length(genes) > 0) {
+        cat("\033[32m", paste("Offline lookup for", length(genes), keytype, "genes"), "\033[0m", "\n")
+        
+        if (keytype == "SYMBOL") {
+          result <- map_symbol_to_ensembl(genes)
+        } else if (keytype == "ENSEMBL") {
+          result <- SYMBOL2ENSEMBL_HUMAN[SYMBOL2ENSEMBL_HUMAN$ENSEMBL %in% genes, ]
+        }
+        return(result)
+      }
+      return(data.frame())
+    }
+    
+    # Batch 1: SYMBOL genes
+    result <- perform_batch_query(symbol_genes, "SYMBOL", c("ENSEMBL", "SYMBOL"))
+    if (nrow(result) > 0) {
+      result$INPUT_NAME <- result$SYMBOL
+      all_results = dplyr::bind_rows(all_results, result)
+    }
+    
+    # Batch 2: ALIAS genes
+    # result <- perform_batch_query(alias_genes, "ALIAS", c("ENSEMBL", "SYMBOL"))
+    # if (nrow(result) > 0) {
+    #   alias_map <- setNames(ALIAS_all$alias_symbol, ALIAS_all$gene_id)
+    #   gene_to_input <- setNames(alias_genes, alias_genes)
+    #   result$INPUT_NAME <- gene_to_input[rownames(result)]
+      
+    #   for (alias_gene in alias_genes) {
+    #     mask <- result$SYMBOL %in% ALIAS_all$alias_symbol[toupper(ALIAS_all$alias_symbol) == toupper(alias_gene)]
+    #     if (any(mask)) result$INPUT_NAME[mask] <- alias_gene
+    #   }
+      
+    #   all_results = dplyr::bind_rows(all_results, result)
+    # }
+    
+    # Batch 3: ENSEMBL genes
+    result <- perform_batch_query(ensembl_genes, "ENSEMBL", c("ENSEMBL", "SYMBOL"))
+    if (nrow(result) > 0) {
+      result$INPUT_NAME <- ensembl_genes[match(result$ENSEMBL, ensembl_genes)]
+      all_results = dplyr::bind_rows(all_results, result)
+    }
+    
+    # Report missing genes
+    found_inputs = unique(all_results$INPUT_NAME)
+    missing_genes = GOterm[!GOterm %in% found_inputs]
+    if(length(missing_genes) > 0) {
+      cat("\033[33m", paste("No match found for:", paste(missing_genes, collapse=", ")), "\033[0m", "\n")
+    }
+    
+    # Check if we found anything
+    if(nrow(all_results) == 0) {
+      stop("No match was found for any genes")
+    }
+    
+    # Create the final mapping preserving input names
+    go2symbol = data.frame(
+      ENSEMBL = all_results$ENSEMBL,
+      SYMBOL = all_results$INPUT_NAME,  # Use original input names
+      stringsAsFactors = FALSE
+    )
+    go2symbol = unique(na.omit(go2symbol))
+
+    cat("Number of unique genes found in the database: ", length(unique(go2symbol$SYMBOL)), "\n")
     
     # Non coding [to be added] 
     #gene.list2 <- chdr.list[grepl("TCONS_", chdr.list$gene_id2, fixed = TRUE),]
     #db2 <- TxDb.Hsapiens.UCSC.hg19.lincRNAsTranscripts
     #symbol2info2 <- transcriptsBy(db2, by=c("gene"), use.names=FALSE)[gene.list2]
     #symbol2info2 <- symbol2info2@unlistData
-    
-    # List genes that were not found in list
-    if (sum(is.na(ind))>0) { cat("\033[33m", paste("No match was found for ", gsub(" ",", ",paste(GOterm[is.na(ind)],collapse = " ")), sep=""), "\033[0m", "\n") }
-    
-    
-    # No match is found  
-  } else {
-    stop("No match was found for GO term")
   }
-  
+    
   
   
   
   ## GENES TX START-END SITE ####   
   cat("\033[33m", "==== Map SNPs to Genes", "\033[0m", "\n")
-  ensembl = useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", GRCh=GRCh)
-  symbol2info = getBM(attributes = c('ensembl_gene_id','chromosome_name','transcript_start', 'transcript_end', 'hgnc_symbol'), 
-                      mart = ensembl, 
-                      filters = 'ensembl_gene_id', 
-                      values = go2symbol$ENSEMBL)
+  #ensembl = useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", GRCh=GRCh)
+  #symbol2info = getBM(attributes = c('ensembl_gene_id','chromosome_name','transcript_start', 'transcript_end', 'hgnc_symbol'), 
+  #                    mart = ensembl, 
+  #                    filters = 'ensembl_gene_id', 
+  #                    values = go2symbol$ENSEMBL)
+
+  # Local retrieval of gene marker data
+  symbol2info = ENSEMBL_COORDS_HUMAN[ENSEMBL_COORDS_HUMAN$ensembl_gene_id %in% go2symbol$ENSEMBL, ]
+  
+  # Create mapping from ENSEMBL back to original input symbols
+  original_symbol_map = setNames(go2symbol$SYMBOL, go2symbol$ENSEMBL)
   
   # Replace empty gene names
   tmp.ind = symbol2info$hgnc_symbol==""
   tmp.symbol = go2symbol$SYMBOL[match(symbol2info$ensembl_gene_id[tmp.ind],go2symbol$ENSEMBL)]
   symbol2info$hgnc_symbol[tmp.ind] = tmp.symbol 
+  
+  # Add original input name to each row
+  symbol2info$original_input = original_symbol_map[symbol2info$ensembl_gene_id]
   
   # remove weird chr names
   chr = symbol2info$chromosome_name
@@ -652,25 +939,91 @@ getHumanGenomeX <- function(GOterm, gene_type, pheno, Yshapes){
   # Skip if no match is found
   if (dim(symbol2info)[1] == 0) { stop("No genes could be mapped to GO search term") }
   
-  # Select maximum transcript size per gene
-  n = length(unique(symbol2info$hgnc_symbol))
+  # SMART GENE NAME RESOLUTION
+  final_genes = data.frame()
+
+  cat("Number of unique genes: ", length(unique(symbol2info$original_input)), "\n")
+  
+  for(original_gene in unique(symbol2info$original_input)) {
+    # Get all Biomart genes that came from this original input
+    biomart_rows = symbol2info[symbol2info$original_input == original_gene, ]
+    biomart_genes = unique(biomart_rows$hgnc_symbol)
+    
+    cat("\033[36m", paste("Original:", original_gene, "-> Biomart found:", paste(biomart_genes, collapse=", ")), "\033[0m", "\n")
+    
+    if(length(biomart_genes) == 1) {
+      # Case 1: One gene returned -> keep original name as proxy
+      biomart_rows$final_symbol = original_gene
+      cat("\033[32m", paste("  Keeping original name:", original_gene), "\033[0m", "\n")
+      
+    } else if(length(biomart_genes) > 1 && single_match == FALSE) {
+      # Case 2: Multiple genes returned
+      if(original_gene %in% biomart_genes) {
+        # Case 2a: Original name is among returned genes -> keep ALL with their Biomart names
+        biomart_rows$final_symbol = biomart_rows$hgnc_symbol
+        cat("\033[32m", paste("  Original found among results -> keeping all:", paste(biomart_genes, collapse=", ")), "\033[0m", "\n")
+        
+      } else {
+        # Case 2b: Original name NOT among returned -> keep original as proxy for first + extras
+        for(i in 1:length(biomart_genes)) {
+          gene_rows = biomart_rows[biomart_rows$hgnc_symbol == biomart_genes[i], ]
+          
+          if(i == 1) {
+            # First gene: use original name as proxy
+            gene_rows$final_symbol = original_gene
+            cat("\033[32m", paste("  Using", original_gene, "as proxy for:", biomart_genes[i]), "\033[0m", "\n")
+          } else {
+            # Additional genes: keep their Biomart names
+            gene_rows$final_symbol = biomart_genes[i]
+            cat("\033[32m", paste("  Adding extra gene:", biomart_genes[i]), "\033[0m", "\n")
+          }
+          
+          # Add to final results
+          if(i == 1) {
+            processed_rows = gene_rows
+          } else {
+            processed_rows = rbind(processed_rows, gene_rows)
+          }
+        }
+        biomart_rows = processed_rows
+      }
+    } else if(length(biomart_genes) > 1 && single_match == TRUE) {
+      if(original_gene %in% biomart_genes) {
+        # Case 3: Multiple genes returned and single_match is TRUE
+        biomart_rows$final_symbol = original_gene
+        cat("\033[32m", paste("  Keeping original name:", original_gene), "\033[0m", "\n")
+      } else {
+        # Case 4: Multiple genes returned and single_match is TRUE but original gene is not among them
+        biomart_rows$final_symbol = biomart_genes[1]
+        cat("\033[32m", paste("  Keeping first gene:", biomart_genes[1]), "\033[0m", "\n")
+      }
+    }
+    
+    final_genes = rbind(final_genes, biomart_rows)
+  }
+
+  
+  # Now use final_symbol for the rest of the processing
+  symbol2info = final_genes
+  
+  # Select maximum transcript size per gene using final symbols
+  n = length(unique(symbol2info$final_symbol))
+
+  cat("Number of unique genes post multiple matches filtering: ", n, "\n")
   
   genvar.name = rep(NA, n)
   genvar.start = rep(NA,  n)
   genvar.end = rep(NA,  n)
   chr.name = rep(NA,  n)
   for(i in 1:n){
-    ind = symbol2info$hgnc_symbol == unique(symbol2info$hgnc_symbol)[i]
+    ind = symbol2info$final_symbol == unique(symbol2info$final_symbol)[i]
     
-    genvar.name[i] = unique(symbol2info$hgnc_symbol[ind])
+    genvar.name[i] = unique(symbol2info$final_symbol[ind])
     genvar.start[i] = min(symbol2info$transcript_start[ind])
     genvar.end[i] = max(symbol2info$transcript_end[ind])
     chr.name[i] = unique(symbol2info$chromosome_name[ind])
   }
   seq.info = data.frame(mgi_symbol = genvar.name, chromosome_name = chr.name, start_position = genvar.start, end_position = genvar.end)
-  
-  
-  
   
   ## FIND MARKERS WITHIN WINDOW ####
   cat("\033[33m", "==== Finding markers within window", "\033[0m", "\n")
@@ -797,255 +1150,15 @@ getHumanGenomeX <- function(GOterm, gene_type, pheno, Yshapes){
   gene.score = gene.score[,1:count]
   gene.id = gene.id[1:count]
   gene.n = gene.n[1:count]
+
+  cat("\033[32m", "DEBUG: Final gene.id list:", paste(gene.id, collapse=", "), "\033[0m", "\n")
+  cat("\033[32m", "DEBUG: Returning gene list:", paste(gene.names, collapse=", "), "\033[0m", "\n")
   
   return(list(as.matrix(gene.score), as.list(gene.names), Yshapes))
   
 }
 
 
-# Extract the human genes of interest and reduce them with PCA, returns X
-getHumanGenomeXTesting <- function(GOterm, gene_type, pheno, Yshapes){
-  
-  tryCatch(
-    {
-      mntpath = "~/Documents/MGP/jovid/MGP_API/humanMGP-master/R/"
-      loadpath1 = paste(mntpath,"HumanMGP/Data/",sep="")
-      loadpath2 = paste(mntpath,"Genetics/",sep="")
-      pls = "cov"
-      window = 0
-      ncomp = 2
-      npc = 1
-      signif = FALSE
-      nperm = 99
-      ncores = 10
-    
-      # Genotypes
-      if (pheno == "YHuman" || pheno == "YHumanDense"){ 
-        bfile = paste(loadpath2,"PITT/Marazita_imputed_qc_prune_rmrel",sep="") 
-        pheno.id = pheno.id.human
-      } else if (pheno == "YHumanTANZ" || pheno == "YHumanTANZDense"){ 
-        bfile = paste(loadpath2,"TANZ/Spritz_imputed_qc_prune_rmrel",sep="") 
-        pheno.id = pheno.id.human.TANZ
-      }
-      geno.full.bim = readBIM(bfile)
-      geno.full.fam =  readFAM(bfile)
-      GRCh = 37
-      
-      
-      ## GENE/GO SEARCH TERM ####
-      cat("\033[33m", "=== Match Genes to Search Term", "\033[0m", "\n")
-      # List all IDs of GO terms available in org.Hs object, and reduce to biological processes
-      GO_ID = toTable(org.Hs.egGO)
-      GO_ID = unique(GO_ID$go_id[GO_ID$Ontology == "BP"])
-      # Match GO IDs with process names
-      GO_all = toTable(GOTERM)
-      GO_BP = GO_all[GO_all$Ontology == "BP",]
-      GO_BP = GO_BP[match(GO_ID,GO_BP$go_id),]
-    
-      
-      # List all gene names available in org.Hs object
-      GENE_all = toTable(org.Hs.egSYMBOL)
-      # Match ensembl IDs with gene names
-      ENSG_all = toTable(org.Hs.egENSEMBL)
-      ind = match(ENSG_all$gene_id,GENE_all$gene_id)
-      GENE_all$ensembl_id = ""; GENE_all$ensembl_id[ind] = ENSG_all$ensembl_id
-      
-      # Biological process (NAME / ID)
-      if (sum(tolower(GOterm) %in% tolower(GO_BP$Term) | tolower(GOterm) %in% tolower(GO_BP$go_id))) {
-        ind1 = match(tolower(GOterm),tolower(GO_BP$Term))
-        ind2 = match(tolower(GOterm),tolower(GO_BP$go_id))
-        ind = c(ind1,ind2); ind = ind[!is.na(ind)]
-        
-        go_id = GO_BP$go_id[ind]
-        go2symbol = unique(na.omit(AnnotationDbi::select(org.Hs.eg.db, keys = go_id, columns = c("ENSEMBL", "SYMBOL"), keytype = "GO")[,-2:-3]))
-        
-        # Gene (NAME / ID)
-      } else if (sum(toupper(GOterm) %in% toupper(GENE_all$symbol) | toupper(GOterm) %in% toupper(GENE_all$ensembl_id))) {   
-        ind1 = match(toupper(GOterm),toupper(GENE_all$symbol))
-        ind2 = match(toupper(GOterm),toupper(GENE_all$ensembl_id))
-        ind = ind1; ind[is.na(ind1)] = ind2[is.na(ind1)]
-        
-        go2symbol = unique(na.omit(AnnotationDbi::select(org.Hs.eg.db, keys = GENE_all$symbol[ind[!is.na(ind)]], columns = c("ENSEMBL", "SYMBOL"), keytype = "SYMBOL")))
-        
-        # Non coding [to be added] 
-        #gene.list2 <- chdr.list[grepl("TCONS_", chdr.list$gene_id2, fixed = TRUE),]
-        #db2 <- TxDb.Hsapiens.UCSC.hg19.lincRNAsTranscripts
-        #symbol2info2 <- transcriptsBy(db2, by=c("gene"), use.names=FALSE)[gene.list2]
-        #symbol2info2 <- symbol2info2@unlistData
-        
-        # List genes that were not found in list
-        if (sum(is.na(ind))>0) { cat("\033[33m", paste("No match was found for ", gsub(" ",", ",paste(GOterm[is.na(ind)],collapse = " ")), sep=""), "\033[0m", "\n") }
-        
-        
-        # No match is found  
-      } else {
-        stop("No match was found for GO term")
-      }
-      
-      
-      
-      
-      ## GENES TX START-END SITE ####   
-      cat("\033[33m", "==== Map SNPs to Genes", "\033[0m", "\n")
-      ensembl = useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl", GRCh=GRCh)
-      symbol2info = getBM(attributes = c('ensembl_gene_id','chromosome_name','transcript_start', 'transcript_end', 'hgnc_symbol'), 
-                          mart = ensembl, 
-                          filters = 'ensembl_gene_id', 
-                          values = go2symbol$ENSEMBL)
-      
-      
-      # Replace empty gene names
-      tmp.ind = symbol2info$hgnc_symbol==""
-      tmp.symbol = go2symbol$SYMBOL[match(symbol2info$ensembl_gene_id[tmp.ind],go2symbol$ENSEMBL)]
-      symbol2info$hgnc_symbol[tmp.ind] = tmp.symbol 
-      
-      # remove weird chr names
-      chr = symbol2info$chromosome_name
-      chr = gsub("HSCHR","",chr);  chr = sapply(strsplit(chr,"_"),"[[",1)
-      symbol2info$chromosome_name = chr
-      if (length(grep(symbol2info$chromosome_name, pattern = "HG")) > 0) { symbol2info = symbol2info[-grep(symbol2info$chromosome_name, pattern = "HG"),] }
-      
-      # Rename sex chromosomes
-      symbol2info$chromosome_name = gsub("X","23",symbol2info$chromosome_name)
-      symbol2info$chromosome_name = gsub("Y","24",symbol2info$chromosome_name)
-      
-      # Skip if no match is found
-      if (dim(symbol2info)[1] == 0) { stop("No genes could be mapped to GO search term") }
-      
-      # Select maximum transcript size per gene
-      n = length(unique(symbol2info$hgnc_symbol))
-      
-      genvar.name = rep(NA, n)
-      genvar.start = rep(NA,  n)
-      genvar.end = rep(NA,  n)
-      chr.name = rep(NA,  n)
-      for(i in 1:n){
-        ind = symbol2info$hgnc_symbol == unique(symbol2info$hgnc_symbol)[i]
-        
-        genvar.name[i] = unique(symbol2info$hgnc_symbol[ind])
-        genvar.start[i] = min(symbol2info$transcript_start[ind])
-        genvar.end[i] = max(symbol2info$transcript_end[ind])
-        chr.name[i] = unique(symbol2info$chromosome_name[ind])
-      }
-      seq.info = data.frame(mgi_symbol = genvar.name, chromosome_name = chr.name, start_position = genvar.start, end_position = genvar.end)
-      
-      
-      ## FIND MARKERS WITHIN WINDOW ####
-      seq.indexes = matrix(nrow = 0, ncol = 3)
-      for (i in 1 : dim(seq.info)[1]) {
-        tmp.markers = geno.full.bim[which(geno.full.bim$chr == as.numeric(seq.info$chromosome_name[i])),]
-        tmp.dist1 = (tmp.markers$bps) > (as.numeric(seq.info$start_position[i]) - window)
-        tmp.dist2 = (tmp.markers$bps) < (as.numeric(seq.info$end_position[i]) + window)
-        ind = which(tmp.dist1 & tmp.dist2)
-        
-        if (length(ind) > 0) { seq.indexes = rbind(seq.indexes,as.matrix(cbind(seq.info$mgi_symbol[i],tmp.markers$vid[ind],tmp.markers$bps[ind]))) }
-      }
-      # Make dataframe
-      seq.indexes = data.frame(gene = seq.indexes[,1], snp = seq.indexes[,2], pos = seq.indexes[,3])
-      
-      # Skip if no markers are found within window
-      if (dim(seq.indexes)[1] == 0) { stop("No SNPs could be mapped to GO search term") }
-      
-      
-      ## REDUCE GENOTYPES IN PLINK #### 
-      plink_path = path.expand("~/Documents/MGP/jovid/MGP_API/humanMGP-master/R/Plink/plink")
-      tmp_path = paste(mntpath,"tmp_mgp/",sep = "/") 
-      if (!dir.exists(tmp_path)){ dir.create(tmp_path) }
-      
-      # Temporarily export SNPs to keep
-      rnd_i = sample(1:1e6,1)
-      tmp = seq.indexes$snp
-      write.csv(tmp, file = paste(tmp_path,"tmp_snp_list_",rnd_i,".txt",sep=""),row.names = F, quote = F)
-      
-      # Run PLINK
-      # Extract SNPs + remove related individuals
-      system2(plink_path, args = paste(" --bfile ", bfile, " --threads ", ncores, " --extract ", tmp_path, "tmp_snp_list_", rnd_i, ".txt --make-bed --out ", tmp_path, "tmp_geno_", rnd_i, " > NUL", sep=""))
-      
-      # Import geno files
-      geno.bim = readBIM(paste(tmp_path,"tmp_geno_",rnd_i,sep=""))
-      geno.fam = readFAM(paste(tmp_path,"tmp_geno_",rnd_i,sep=""))
-      geno.bed = readBED(paste(tmp_path,"tmp_geno_",rnd_i,sep="")); geno.bed = as.data.frame(geno.bed)
-      
-      # Remove tmp files
-      unlink(paste(tmp_path,"tmp_snp_list_",rnd_i,".txt",sep=""))
-      unlink(paste(tmp_path,"tmp_geno_",rnd_i,".bed",sep=""))
-      unlink(paste(tmp_path,"tmp_geno_",rnd_i,".bim",sep=""))
-      unlink(paste(tmp_path,"tmp_geno_",rnd_i,".fam",sep=""))
-      unlink(paste(tmp_path,"tmp_geno_",rnd_i,".log",sep=""))
-      
-
-      ## CHECK ORDER OF GENO AND PHENO ####
-      ## ENSURE MATCHING SUBJECTS IN GENOTYPE AND SHAPE DATA ####
-      common_subjects = intersect(geno.fam$iid, pheno.id)
-      
-      # Filter Yshapes and pheno.id
-      pheno_indices = match(common_subjects, pheno.id)
-      Yshapes = Yshapes[pheno_indices, ]
-      pheno.id = pheno.id[pheno_indices]
-      
-      # Filter geno.fam and geno.bed
-      geno_indices = match(common_subjects, geno.fam$iid)
-      geno.fam = geno.fam[geno_indices, , drop=F]
-      geno.bed = geno.bed[geno_indices, , drop=F]
-      
-      ## REPLACE MISSING GENO WITH MAJOR GENOTYPE #### 
-      geno.0 = colSums(geno.bed==0,na.rm = T)
-      geno.1 = colSums(geno.bed==1,na.rm = T)
-      geno.2 = colSums(geno.bed==2,na.rm = T)
-      tmp.geno = rbind(geno.0,geno.1,geno.2)
-      
-      max.ind = apply(tmp.geno, 2, function(x) which.max(x))
-      max.val = gsub("geno.","",rownames(tmp.geno)[max.ind])
-      max.val = matrix(data=as.numeric(max.val),nrow=dim(geno.bed)[1],ncol=dim(geno.bed)[2],byrow = T)
-      
-      geno.bed[is.na(geno.bed)] = max.val[is.na(geno.bed)]
-      
-      
-      ## GET GENE COMPOSITE SCORE ####
-      cat("\033[33m", "===== Get Gene Composite Score", "\033[0m", "\n")
-      
-      #  Do PCA per gene
-      gene.names <- unique(seq.indexes$gene)
-      n_gen <- length(gene.names)
-      
-      gene.score = matrix(NA,dim(Yshapes)[1],1e4)
-      gene.id = matrix(NA,1,1e4)
-      gene.n = matrix(NA,1,1e4)
-      count = 0
-      for (i in 1:n_gen) {
-        ind <- seq.indexes$gene %in% gene.names[i]
-        
-        # PCA
-        tmp.pca <- fast.prcomp(geno.bed[,ind])
-        
-        pc_axis = 1
-        n = 1
-        if (npc == "all"){
-          # Parallel analysis (only needed if more than 1 SNP is defined within gene)
-          if (sum(ind)>1){
-            tmp.pca.pa = paran(geno.bed[,ind], quietly = T, status = F, all = T, iterations = 50, centile = 5)
-            pc_axis = which(tmp.pca.pa$Ev>tmp.pca.pa$RndEv)
-            n = length(pc_axis)
-            if (n==0){ pc_axis = 1; n = 1 }
-          }
-        }
-        
-        gene.score[,(count+1):(count+n)] = as.matrix(tmp.pca$x[,pc_axis])
-        tmp.gene.id = as.data.frame(cbind(rep(gene.names[i],1,n),as.character(1:n)))
-        gene.id[(count+1):(count+n)] = apply(tmp.gene.id[ , 1:2 ], 1, paste, collapse = "_" )
-        gene.n[(count+1):(count+n)] = matrix(n,1,n)
-        count = count + n
-      }
-      gene.score = gene.score[,1:count]
-      gene.id = gene.id[1:count]
-      gene.n = gene.n[1:count]
-      
-      return(list(as.matrix(gene.score), as.list(gene.names)))
-    }, error = function(e){
-      message("Error in gene extraction function: ", e$message)
-      return(NA)
-    })
-}
 
 #core mgp function####
 mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda = .06, pls_axis = 1, pheno="Y", remove_pc1=F, use_standardized_PCA=F, permutation = 0, doPermutation = F, rangenes = 0, doRangenes = F){
@@ -1218,40 +1331,138 @@ mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda
     })
   }
   
-  approximate.p <- -1
-  perm.r2 <- -1
-  perm.pdist.mean <- -1
+  # ------------------------------
+  # 1.   PRE-ALLOCATION & SETTINGS
+  # ------------------------------
+  approximate.p <- -1        # Final permutation p-value for the full model, indicating the probability that the observed variance explained is due to chance.
+  perm.r2 <- -1              # Vector to store both the observed R² and the null R²s from permutations, representing the proportion of variance explained.
+  perm.pdist.mean <- -1      # Distance statistic for the “3 SD shape”, measuring how far an extrapolated shape is from the mean shape.
+  # Lists to collect component-wise and landmark-wise permutation results
+  perm.r2.components <- list()   # R² per component for each permutation, showing variance explained by each component.
+  perm.r2.landmark <- list() # R2 per landmark for each permutation, showing variance explained by each landmark.
+  component.p.values <- c()      # Stores formatted p-values for each component, reflecting the probability that the component's effect is due to chance.
+  component.effect.sizes <- c()  # Component effect sizes, calculated as the absolute difference in variance explained divided by the standard deviation.
+  landmark.p.values <- c()       # P-values for landmarks, indicating the probability that the observed landmark error is due to chance.
+  landmark.effect.sizes <- c()   # Landmark effect sizes, representing the standardized difference in landmark errors.
+
   if(doPermutation){
-    if(as.numeric(permutation)>200){
-      permutation = 200
-    }else if(as.numeric(permutation)<2){
-      permutation = 2
+
+    # ---- Safety: keep number of permutations within reasonable bounds ----
+    if(as.numeric(permutation) > 5000){
+      permutation <- 5000  # Limit permutations to 5000 to prevent excessive computation.
+    }else if(as.numeric(permutation) < 2){
+      permutation <- 2     # Ensure at least 2 permutations for meaningful results.
+    }    
+    permutation <- as.numeric(permutation)
+    
+    perm.result <- rep(NA, permutation)     # Pre-allocate space for global R² from each permutation, representing variance explained.
+
+    # ---- Reserve space: one vector per PLS component ---------------------
+    for(comp in 1:pls_axis){
+      perm.r2.components[[comp]] <- rep(NA, permutation)  # Pre-allocate space for R² of each component across permutations.
     }
-    perm.result <- rep(NA, permutation)
-    
-    # Mean shape of data
-    Y_mat = row2array3d(Yshapes, Nlandmarks = ncol(Y_before)/3)
-    data.mean.shape <- apply(Y_mat, c(1,2), mean)
-    
+
+    # ---- Reserve space: one vector per landmark --------------------------
+    # Determine number of landmarks based on phenotype type.
+    if(pheno %in% c("YHumanDense","YHumanTANZDense")){
+      for(lmk in 1:nlandmarks){
+        perm.r2.landmark[[lmk]] <- rep(NA, permutation)  # Pre-allocate space for landmark errors across permutations.
+      }
+    }else{
+      for(lmk in 1:(ncol(Y_before)/3)){
+        perm.r2.landmark[[lmk]] <- rep(NA, permutation)  # Pre-allocate space for landmark errors across permutations.
+      }
+    }
+            
+    # ------------------------------
+    # 2.   PREPARE ORIGINAL SHAPES
+    # ------------------------------
+    YshapesReversed <- reversePCA(Yshapes, Y_pca_result, use_standardized_PCA)  # Reverse PCA to get original shapes.
+    if(pheno %in% c("YHumanDense","YHumanTANZDense")){
+      YshapesReversed <- reverse_pca_dense(YshapesReversed)  # Undo dense encoding for dense phenotypes.
+      Y_mat <- row2array3d(YshapesReversed, Nlandmarks = nlandmarks)
+    } else {
+      Y_mat <- row2array3d(YshapesReversed, Nlandmarks = ncol(Y_before)/3)
+    }
+    data.mean.shape <- apply(Y_mat, c(1,2), mean)  # Calculate the grand mean configuration of the shapes.
+
+    # ==============================
+    # 3.   PERMUTATION LOOP
+    # ==============================
     for(i in 1:length(perm.result)){
-      process.svd <- ddsPLS(X = probs.rows, Y = as.matrix(Yshapes[sample(1:nrow(Yshapes), size = nrow(Yshapes)),]), lambdas = rep(lambda, pls_axis), NCORES=6, verbose=TRUE, doBoot = FALSE)
+      print(paste("Permutation #",i,"/",length(perm.result),"\n"))
       
-      #R2
+      # 3a) Break the X-Y link, fit ddsPLS, predict Y
+      process.svd <- ddsPLS(
+          X       = probs.rows,
+          Y       = as.matrix(Yshapes[ sample(1:nrow(Yshapes)), ]), # Randomly shuffle Y to break the link with X.
+          lambdas = rep(lambda, pls_axis),
+          NCORES  = 6,
+          verbose = TRUE,
+          doBoot  = FALSE
+      )
+      
+      # 3b) GLOBAL R² under permutation
       full.pred <- predict(process.svd, probs.rows)$y
-      full.pred = reversePCA(full.pred, Y_pca_result, use_standardized_PCA)
-      Y_col_means = matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow=TRUE)
-      ess <- sum((full.pred - Y_col_means)^2)
-      tss <- sum((Y_before - Y_col_means)^2)
-      perm.result[i] <- sqrt(ess/tss)
+      full.pred <- reversePCA(full.pred, Y_pca_result, use_standardized_PCA)
+      Y_col_means <- matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow = TRUE)
+      ess <- sum((full.pred - Y_col_means)^2)            # Explained sum of squares (ESS), variance explained by the model.
+      tss <- sum((Y_before - Y_col_means)^2)             # Total sum of squares (TSS), total variance in the data.
+      perm.result[i] <- sqrt(ess/tss)                    # √R², the square root of the proportion of variance explained. The square root is used to provide a measure of correlation, which is more interpretable in terms of linear relationships.
+
+      # 3c) COMPONENT-WISE R² under permutation
+      for(comp in 1:pls_axis){
+        # Reconstruct Y using only component 'comp'
+        comp.pred <- process.svd$model$t[,comp,drop=FALSE] %*% t(process.svd$model$C[,comp,drop=FALSE])
+        comp.pred <- comp.pred * t(replicate(nrow(comp.pred), process.svd$model$sdY)) + t(replicate(nrow(comp.pred), process.svd$model$muY))
+        comp.pred <- reversePCA(comp.pred, Y_pca_result, use_standardized_PCA)
+        comp.ess  <- sum((comp.pred - Y_col_means)^2)  # ESS for the component.
+        perm.r2.components[[comp]][i] <- sqrt(comp.ess / tss)  # √R² for the component, variance explained by this component. The square root here also provides a correlation-like measure for each component.
+      }
       
-      #Pdist
+      # 3d) LANDMARK-WISE √R² under permutation (same methodology as global)
+      if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+        perm.pred.dense <- reverse_pca_dense(full.pred)
+        perm.true.dense <- reverse_pca_dense(Y_before)
+      }else{
+        perm.pred.dense <- full.pred
+        perm.true.dense <- Y_before
+      }
+
+      if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+        n_landmarks <- nlandmarks
+      }else{
+        n_landmarks <- ncol(Y_before)/3
+      }
       
-      # Calculate projection of 3 stdev for each permutation
+      print(paste("DEBUG: In permutation loop, n_landmarks =", n_landmarks))
+      print(paste("DEBUG: length(perm.r2.landmark) =", length(perm.r2.landmark)))
+      
+      for(lmk in 1:n_landmarks){
+        # Extract the 3 columns (x,y,z) for this landmark
+        lmk_cols <- ((lmk-1)*3 + 1):(lmk*3)
+        
+        print(paste("DEBUG: Processing landmark", lmk, "of", n_landmarks))
+        
+        # Same ESS/TSS calculation as observed model
+        lmk_pred <- perm.pred.dense[, lmk_cols, drop=FALSE]
+        lmk_true <- perm.true.dense[, lmk_cols, drop=FALSE]
+        lmk_means <- matrix(colMeans(lmk_true), nrow = nrow(lmk_true), ncol = 3, byrow = TRUE)
+        
+        ess_lmk <- sum((lmk_pred - lmk_means)^2)
+        tss_lmk <- sum((lmk_true - lmk_means)^2)
+        
+        perm.r2.landmark[[lmk]][i] <- sqrt(ess_lmk / tss_lmk)  # Store √R² instead of Euclidean error
+      }
+      
+      
+      # 3e) Pdist: distance of a 3 SD extrapolated shape to the mean shape
+      # Calculate projection of 3 standard deviations for each permutation
       # Get the mean and standard deviation of the first PLS axis
       mean_score <- apply(process.svd$model$t, 2, mean)
       sd_score <- apply(process.svd$model$t, 2, sd)
       new_score <- matrix(0, ncol = length(mean_score), nrow = 1)
-      new_score[1, ] <- mean_score + 3 * sd_score
+      new_score[1, ] <- mean_score + 3 * sd_score  # Extrapolate 3 standard deviations along the PLS axis.
       
       # Get the coefficient vector from the first response block
       c <- process.svd$model$C
@@ -1271,19 +1482,140 @@ mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda
       }
       
       pred.shape <- pred.shape[,,1]
-
-      perm.pdist.mean[i] <- sqrt(sum((pred.shape - data.mean.shape)^2))
+      
+      perm.pdist.mean[i] <- sqrt(sum((pred.shape - data.mean.shape)^2))  # Distance of the extrapolated shape from the mean shape, providing insight into the variability and extremity of shape changes.
     }
     
+    # ==============================
+    # 4.   OBSERVED (REAL) MODEL
+    # ==============================
     full.pred <- predict(pls.svd, probs.rows)$y
     full.pred = reversePCA(full.pred, Y_pca_result, use_standardized_PCA)
     Y_col_means = matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow=TRUE)
-    ess <- sum((full.pred - Y_col_means)^2)
-    tss <- sum((Y_before - Y_col_means)^2)
-    perm.r2 <- c(sqrt(ess/tss), perm.result)
-    approximate.p <- sum(sqrt(ess/tss) < perm.result)/length(perm.result)
+    ess <- sum((full.pred - Y_col_means)^2)  # ESS for the observed model.
+    tss <- sum((Y_before - Y_col_means)^2)   # TSS for the observed data.
+    perm.r2 <- c(sqrt(ess/tss), perm.result)  # Prepend observed √R² to permutation results. The square root provides a correlation measure, connecting variance explained to model fit.
+    approximate.p <- sum(sqrt(ess/tss) < perm.result)/length(perm.result)  # Calculate p-value for the observed model, probability that observed R² is due to chance.
+    approximate.effect.size <- round(abs((sqrt(ess/tss) - mean(perm.result))/sd(perm.result)), 3)
+
+    # ------------------------------
+    # 5.   COMPONENT-LEVEL INFERENCE
+    # ------------------------------
+    for(comp in 1:pls_axis){
+      # Calculate actual R² for this component
+      comp.pred <- pls.svd$model$t[, comp, drop=FALSE] %*% t(pls.svd$model$C[, comp, drop=FALSE])
+      comp.pred <- comp.pred * t(replicate(nrow(comp.pred), pls.svd$model$sdY))
+      comp.pred <- comp.pred + t(replicate(nrow(comp.pred), pls.svd$model$muY))
+      comp.pred <- reversePCA(comp.pred, Y_pca_result, use_standardized_PCA)
+      
+      comp.ess <- sum((comp.pred - Y_col_means)^2)  # ESS for the component.
+      actual.comp.r2 <- sqrt(comp.ess/tss)  # √R² for the component, variance explained by this component. The square root here provides a correlation-like measure for each component.
+      
+      # P-value for component using permutation method
+      component.p.values[comp] <- sum(actual.comp.r2 < perm.r2.components[[comp]]) / length(perm.r2.components[[comp]])  # Probability that the component's effect is due to chance.
+
+      
+      # Effect size for component
+      component.effect.sizes[comp] <- round(abs((actual.comp.r2 - mean(perm.r2.components[[comp]]))/sd(perm.r2.components[[comp]])), 3)  # Standardized effect size for the component, showing the magnitude of the component's effect relative to variability.
+    }
+    
+    # ------------------------------
+    # 6.   LANDMARK-LEVEL INFERENCE
+    # ------------------------------
+    # Convert back to coordinate space for landmark-wise analysis
+    if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+      full.pred.dense <- reverse_pca_dense(full.pred)
+      full.pred.coords <- full.pred.dense
+      Y_before.coords <- reverse_pca_dense(Y_before)
+    }else{
+      full.pred.coords <- full.pred
+      Y_before.coords <- Y_before
+    }
+    
+    landmark.actual.R2 <- numeric(nlandmarks)
+    for(lmk in 1:nlandmarks){
+      # Extract the 3 columns (x,y,z) for this landmark
+      lmk_cols <- ((lmk-1)*3 + 1):(lmk*3)
+      
+      # Apply same ESS/TSS logic as global model, but only for this landmark's coordinates
+      lmk_pred <- full.pred.coords[, lmk_cols, drop=FALSE]
+      lmk_true <- Y_before.coords[, lmk_cols, drop=FALSE]
+      lmk_means <- matrix(colMeans(lmk_true), nrow = nrow(lmk_true), ncol = 3, byrow = TRUE)
+      
+      ess_lmk <- sum((lmk_pred - lmk_means)^2)  # ESS for this landmark
+      tss_lmk <- sum((lmk_true - lmk_means)^2)  # TSS for this landmark
+      
+      landmark.actual.R2[lmk] <- sqrt(ess_lmk / tss_lmk)  # √R² for this landmark
+      
+      # P-value: upper tail (higher √R² is better, same as global and component tests)
+      lmk.p <- sum(landmark.actual.R2[lmk] < perm.r2.landmark[[lmk]]) / 
+                length(perm.r2.landmark[[lmk]])
+      landmark.p.values[lmk] <- lmk.p
+      
+      # Effect size (standardized difference)
+      landmark.effect.sizes[lmk] <- round(
+          abs((landmark.actual.R2[lmk] - mean(perm.r2.landmark[[lmk]])) / 
+              sd(perm.r2.landmark[[lmk]])), 3)
+    }
+    
+    # Debug visualization: plot landmarks colored by p-value gradient
+    if(DEBUG){ # Set to TRUE to enable debug visualization
+      
+      # Get mean shape for visualization
+      if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+        Y_before.array <- row2array3d(reverse_pca_dense(Y_before), Nlandmarks = nlandmarks)
+      }else{
+        Y_before.array <- row2array3d(Y_before, Nlandmarks = ncol(Y_before)/3)
+      }
+      mean.shape <- apply(Y_before.array, c(1,2), mean)
+      
+      # Create gradient based on actual p-value range (0 to max observed)
+      max_p <- max(landmark.p.values, na.rm = TRUE)
+      min_p <- 0  # Always start from 0 for p-values
+      
+      # Color gradient: green (p=0, most significant) to red (p=max, least significant)
+      colors <- colorRampPalette(c("darkgreen", "green", "yellow", "orange", "red"))(100)
+      
+      # Scale p-values to [0,1] based on actual range
+      if(max_p > min_p){
+        p.values.scaled <- (landmark.p.values - min_p) / (max_p - min_p)
+      } else {
+        p.values.scaled <- rep(0, length(landmark.p.values))  # All p-values are the same
+      }
+      
+      # Map to color indices (1-100)
+      color.indices <- pmax(1, pmin(100, ceiling(p.values.scaled * 99) + 1))
+      
+      # Open 3D window
+      open3d()
+      
+      # Plot landmarks with gradient colors
+      for(lmk in 1:nlandmarks){
+        points3d(mean.shape[lmk,1], mean.shape[lmk,2], mean.shape[lmk,3], 
+                  col=colors[color.indices[lmk]], size=10)
+      }
+      
+      # Create informative legend with actual p-value ranges
+      legend_p_values <- c(min_p, max_p/4, max_p/2, 3*max_p/4, max_p)
+      legend_labels <- sprintf("p = %.3f", legend_p_values)
+      legend_colors <- colors[c(1, 25, 50, 75, 100)]
+      
+      legend3d("topright", 
+                legend = legend_labels,
+                col = legend_colors, 
+                pch = 16, 
+                cex = 1.2)
+      
+      title3d(main = sprintf("Landmarks colored by p-value (0 to %.3f)", max_p))
+      
+      # Print summary statistics
+      cat(sprintf("P-value range: %.4f to %.4f\n", min(landmark.p.values), max(landmark.p.values)))
+      cat(sprintf("Mean p-value: %.4f\n", mean(landmark.p.values)))
+      cat(sprintf("Significant landmarks (p < 0.05): %d/%d\n", 
+                  sum(landmark.p.values < 0.05), length(landmark.p.values)))
+    }
   }
-  
+
   
   # Random gene analysis, same number of genes but random, compared to the original 
   # list result in terms of the coherence, which is defined as the salient vectors 
@@ -1292,8 +1624,8 @@ mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda
   rangenes.coherence <- -1
   rangenes.coherence.shapes <- -1
   if(doRangenes){
-    if(as.numeric(rangenes)>200){
-      rangenes = 200
+    if(as.numeric(rangenes)>5000){
+      rangenes = 5000
     }else if(as.numeric(rangenes)<2){
       rangenes = 2
     }
@@ -1301,8 +1633,15 @@ mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda
     
     rangenes.coherence.shapes <- array(NA, dim = c(length(rangenes.result), ncol(Yshapes) / 3, 3)) 
     
+    YshapesReversed = reversePCA(Yshapes, Y_pca_result,  use_standardized_PCA)      
+      
     # Mean shape of data
-    Y_mat = row2array3d(Yshapes, Nlandmarks = ncol(Y_before)/3)
+    if (pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+      YshapesReversed = reverse_pca_dense(YshapesReversed)
+      Y_mat = row2array3d(YshapesReversed, Nlandmarks = nlandmarks)
+    }else{
+      Y_mat = row2array3d(YshapesReversed, Nlandmarks = ncol(Y_before)/3)
+    }
     data.mean.shape <- apply(Y_mat, c(1,2), mean)
     
     # #FIND ALL FAULTY GENES
@@ -1423,15 +1762,15 @@ mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda
           # Start randomizing the gene selection
           # select the ENSEMBL and SYMBOL columns from the org.Mm.eg.db object
           if(pheno %in% pheno_names_human){
-            curated_genes <- get_curated_gene_list_human()
+            curated_genes <- get_curated_gene_list_human(pheno)
           }else{
             curated_genes <- get_curated_gene_list()
           }
 
-          rangenes.gene2symbol <- curated_genes[sample(nrow(curated_genes), length(gene.names)), ]
+          rangenes.gene2symbol <- curated_genes[sample(nrow(curated_genes), length(selection.vector)), ]
           
           if(pheno %in% pheno_names_human){
-            res = getHumanGenomeXTesting(rangenes.gene2symbol[,1]$SYMBOL, "custom", pheno, Yshapes)
+            res = getHumanGenomeX(rangenes.gene2symbol$SYMBOL, "custom", pheno, Yshapes, single_match = TRUE)
             random.probs.rows = res[[1]]
             random.gene.names = res[[2]]
           }else{
@@ -1894,14 +2233,28 @@ mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda
   displacement_max = max(displacement)
   
   if(doPermutation){
-    #p_vs_scrambledsubjects = approximate.p
-    #esize_vs_scrambledsubjects = round(abs((procrustes_dist - mean(perm.pdist.mean))/(sd(perm.pdist.mean))), 3)
-    p_vs_scrambledsubjects = pnorm(q = perm.r2[1], mean=mean(perm.result), sd=sd(perm.result), lower.tail = FALSE)#approximate.p
+    # Global permutation results
+    p_vs_scrambledsubjects = approximate.p #pnorm(q = perm.r2[1], mean=mean(perm.result), sd=sd(perm.result), lower.tail = FALSE)
     p_vs_scrambledsubjects = ifelse(p_vs_scrambledsubjects < 0.0001, sprintf("%.2e", p_vs_scrambledsubjects), as.character(round(p_vs_scrambledsubjects, digits = 4)))
-    esize_vs_scrambledsubjects = round(abs((perm.r2[1]-mean(perm.result))/sd(perm.result)), 3)
+    esize_vs_scrambledsubjects = approximate.effect.size
+    
+    # Component-wise permutation results
+    p_vs_scrambledsubjects_components = sapply(component.p.values, function(p) {
+      ifelse(p < 0.0001, sprintf("%.2e", p), as.character(round(p, digits = 4)))
+    })
+    esize_vs_scrambledsubjects_components = component.effect.sizes
+    
+    # Landmark-wise permutation results  
+    p_vs_scrambledsubjects_landmarks = landmark.p.values
+    esize_vs_scrambledsubjects_landmarks = landmark.effect.sizes
+    
   }else{
     p_vs_scrambledsubjects = -1
     esize_vs_scrambledsubjects = -1
+    p_vs_scrambledsubjects_components = -1
+    esize_vs_scrambledsubjects_components = -1
+    p_vs_scrambledsubjects_landmarks = -1
+    esize_vs_scrambledsubjects_landmarks = -1
   }
   
   # rangenes.coherence
@@ -1927,12 +2280,17 @@ mgp <- function(GO.term = "chondrocyte differentiation", Yshapes, cv = F, lambda
   }
     
   return(list(loadings = loadings_list, pheno1 = proj.coords_components_a1, pheno2 = proj.coords_components_a2, 
-              pheno_loadings = t(pls.svd$model$C), p_value = approximate.p, 
-              perm_r2 = perm.r2, perm_pdist_mean = perm.pdist.mean,
-              variance_explained = variance_explained, BIC=BIC, genelist=gene.names, regression_error=regression_error,
-              pls_mag=pls_mag, procrustes_dist=procrustes_dist, displacement_mean=displacement_mean, displacement_max=displacement_max,
-              p_vs_rangenes=p_vs_rangenes, p_vs_scrambledsubjects=p_vs_scrambledsubjects, esize_vs_rangenes=esize_vs_rangenes,
-              esize_vs_scrambledsubjects=esize_vs_scrambledsubjects, histogram_df=histogram_df))
+            pheno_loadings = t(pls.svd$model$C), p_value = approximate.p, 
+            perm_r2 = perm.r2, perm_pdist_mean = perm.pdist.mean,
+            variance_explained = variance_explained, BIC=BIC, genelist=gene.names, regression_error=regression_error,
+            pls_mag=pls_mag, procrustes_dist=procrustes_dist, displacement_mean=displacement_mean, displacement_max=displacement_max,
+            p_vs_rangenes=p_vs_rangenes, p_vs_scrambledsubjects=p_vs_scrambledsubjects, esize_vs_rangenes=esize_vs_rangenes,
+            esize_vs_scrambledsubjects=esize_vs_scrambledsubjects, 
+            p_vs_scrambledsubjects_components=p_vs_scrambledsubjects_components,
+            esize_vs_scrambledsubjects_components=esize_vs_scrambledsubjects_components,
+            p_vs_scrambledsubjects_landmarks=p_vs_scrambledsubjects_landmarks,
+            esize_vs_scrambledsubjects_landmarks=esize_vs_scrambledsubjects_landmarks,
+            histogram_df=histogram_df))
 }
 
 #custom MGP function####
@@ -1941,19 +2299,19 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
     # genelist = c("PAX3","EYA4","PKHD1","RPS12","SRBD1","TWIST1","KAT7")
     # cv = F
     # lambda = 0
-    # pls_axis = 1
+    # pls_axis = 3
     # pheno = "YHumanDense"
     # remove_pc1 = F
     # use_standardized_PCA = F
     # permutation = 40
-    # doPermutation = F
+    # doPermutation = T
     # rangenes = 40
     # doRangenes = F
     # pheno_index = "1:5629"
-    # coordinate.table <- matrix(1:(ncol(get(pheno))), ncol = 3, byrow = T)
-    # selected.pheno <- eval(parse(text = pheno_index))
-    # pheno.xyz <- as.numeric(t(coordinate.table[selected.pheno,]))
-    # Yshapes = subset(get(pheno), select = pheno.xyz)
+    # # coordinate.table <- matrix(1:(ncol(get(pheno))), ncol = 3, byrow = T)
+    # # selected.pheno <- eval(parse(text = pheno_index))
+    # # pheno.xyz <- as.numeric(t(coordinate.table[selected.pheno,]))
+    # # Yshapes = subset(get(pheno), select = pheno.xyz)
     # Yshapes = get(pheno)
 
     # Remove PC1 if True
@@ -1971,14 +2329,23 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
       Yshapes <- Yshapes - reconstructed_pc1
     }  
   
-    
+    Yshapes_original = Yshapes
     if(pheno=="YHuman" || pheno=="YHumanTANZ" || pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
       selection.vector <- as.character(genelist)
+      print(selection.vector)
+      print(dim(Yshapes))
       res = getHumanGenomeX(selection.vector, "custom", pheno, Yshapes)
       probs.rows = res[[1]]
       gene.names = res[[2]]
       Yshapes = res[[3]]
-      
+
+      cat("selection.vector and gene.names: ", selection.vector, " - gene names: ", as.character(gene.names), "\n")
+      cat("number of genes: ", length(gene.names), "\n")
+      cat("number of genelist: ", length(genelist), "\n")
+
+      cat("Yshapes: ", dim(Yshapes), "\n")
+      cat("probs.rows: ", dim(probs.rows), "\n")
+            
       Y_before = Yshapes
       stddPCA = standardizePCA(Yshapes, use_standardized_PCA, 97)
       Yshapes = stddPCA$Yshapes
@@ -2085,40 +2452,153 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
     print(paste("Max number of components:", max_components))
     
     
-    approximate.p <- -1
-    perm.r2 <- -1
-    perm.pdist.mean <- -1
+    # ------------------------------
+    # 1.   PRE-ALLOCATION & SETTINGS
+    # ------------------------------
+    approximate.p <- -1        # Final permutation p-value for the full model, indicating the probability that the observed variance explained is due to chance.
+    perm.r2 <- -1              # Vector to store both the observed R² and the null R²s from permutations, representing the proportion of variance explained.
+    perm.pdist.mean <- -1      # Distance statistic for the “3 SD shape”, measuring how far an extrapolated shape is from the mean shape.
+    # Lists to collect component-wise and landmark-wise permutation results
+    perm.r2.components <- list()   # R² per component for each permutation, showing variance explained by each component.
+    perm.r2.landmark <- list() # R2 per landmark for each permutation, showing variance explained by each landmark.
+    component.p.values <- c()      # Stores formatted p-values for each component, reflecting the probability that the component's effect is due to chance.
+    component.effect.sizes <- c()  # Component effect sizes, calculated as the absolute difference in variance explained divided by the standard deviation.
+    landmark.p.values <- c()       # P-values for landmarks, indicating the probability that the observed landmark error is due to chance.
+    landmark.effect.sizes <- c()   # Landmark effect sizes, representing the standardized difference in landmark errors.
+
     if(doPermutation){
-      if(as.numeric(permutation)>200){
-        permutation = 200
-      }else if(as.numeric(permutation)<2){
-        permutation = 2
+
+      # ---- Safety: keep number of permutations within reasonable bounds ----
+      if(as.numeric(permutation) > 5000){
+        permutation <- 5000  # Limit permutations to 5000 to prevent excessive computation.
+      }else if(as.numeric(permutation) < 2){
+        permutation <- 2     # Ensure at least 2 permutations for meaningful results.
+      }    
+      permutation <- as.numeric(permutation)
+      perm.result <- rep(NA, permutation)     # Pre-allocate space for global R² from each permutation, representing variance explained.
+
+      # ---- Reserve space: one vector per PLS component ---------------------
+      for(comp in 1:pls_axis){
+        perm.r2.components[[comp]] <- rep(NA, permutation)  # Pre-allocate space for R² of each component across permutations.
       }
-      perm.result <- rep(NA, permutation)
-      
-      # Mean shape of data
-      Y_mat = row2array3d(Yshapes, Nlandmarks = ncol(Y_before)/3)
-      data.mean.shape <- apply(Y_mat, c(1,2), mean)
-      
+
+      # ---- Reserve space: one vector per landmark --------------------------
+      # Determine number of landmarks based on phenotype type.
+      if(pheno %in% c("YHumanDense","YHumanTANZDense")){
+        for(lmk in 1:nlandmarks){
+          perm.r2.landmark[[lmk]] <- rep(NA, permutation)  # Pre-allocate space for landmark errors across permutations.
+        }
+      }else{
+        for(lmk in 1:(ncol(Y_before)/3)){
+          perm.r2.landmark[[lmk]] <- rep(NA, permutation)  # Pre-allocate space for landmark errors across permutations.
+        }
+      }
+
+      # Add this BEFORE the permutation loop starts
+      Y_col_means <- matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow = TRUE)
+      tss <- sum((Y_before - Y_col_means)^2)
+              
+      # ------------------------------
+      # 2.   PREPARE ORIGINAL SHAPES
+      # ------------------------------
+      YshapesReversed <- reversePCA(Yshapes, Y_pca_result, use_standardized_PCA)  # Reverse PCA to get original shapes.
+      if(pheno %in% c("YHumanDense","YHumanTANZDense")){
+        YshapesReversed <- reverse_pca_dense(YshapesReversed)  # Undo dense encoding for dense phenotypes.
+        Y_mat <- row2array3d(YshapesReversed, Nlandmarks = nlandmarks)
+      } else {
+        Y_mat <- row2array3d(YshapesReversed, Nlandmarks = ncol(Y_before)/3)
+      }
+      data.mean.shape <- apply(Y_mat, c(1,2), mean)  # Calculate the grand mean configuration of the shapes.
+
+      # ==============================
+      # 3.   PERMUTATION LOOP
+      # ==============================
       for(i in 1:length(perm.result)){
-        process.svd <- ddsPLS(X = probs.rows, Y = as.matrix(Yshapes[sample(1:nrow(Yshapes), size = nrow(Yshapes)),]), lambdas = rep(lambda, pls_axis), NCORES=6, verbose=TRUE, doBoot = FALSE)
+        print(paste("Permutation #",i,"/",length(perm.result),"\n"))
+
+        if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+          n_landmarks <- nlandmarks
+        }else{
+          n_landmarks <- ncol(Y_before)/3
+        }
         
-        #R2
+        # 3a) Break the X-Y link, fit ddsPLS, predict Y
+        process.svd <- ddsPLS(
+            X       = probs.rows,
+            Y       = as.matrix(Yshapes[ sample(1:nrow(Yshapes)), ]), # Randomly shuffle Y to break the link with X.
+            lambdas = rep(lambda, pls_axis),
+            NCORES  = 6,
+            verbose = TRUE,
+            doBoot  = FALSE
+        )
+        
+        # 3b) GLOBAL R² under permutation
         full.pred <- predict(process.svd, probs.rows)$y
-        full.pred = reversePCA(full.pred, Y_pca_result, use_standardized_PCA)
-        Y_col_means = matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow=TRUE)
-        ess <- sum((full.pred - Y_col_means)^2)
-        tss <- sum((Y_before - Y_col_means)^2)
-        perm.result[i] <- sqrt(ess/tss)
+        full.pred <- reversePCA(full.pred, Y_pca_result, use_standardized_PCA)
+        #Y_col_means <- matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow = TRUE)
+        ess <- sum((full.pred - Y_col_means)^2)            # Explained sum of squares (ESS), variance explained by the model.
+        #tss <- sum((Y_before - Y_col_means)^2)             # Total sum of squares (TSS), total variance in the data.
+        perm.result[i] <- sqrt(ess/tss)                    # √R², the square root of the proportion of variance explained. The square root is used to provide a measure of correlation, which is more interpretable in terms of linear relationships.
+
+        # 3c) COMPONENT-WISE R² under permutation
+        for(comp in 1:pls_axis){
+          # Reconstruct Y using only component 'comp'
+          comp.pred <- process.svd$model$t[,comp,drop=FALSE] %*% t(process.svd$model$C[,comp,drop=FALSE])
+          comp.pred <- comp.pred * t(replicate(nrow(comp.pred), process.svd$model$sdY)) + t(replicate(nrow(comp.pred), process.svd$model$muY))
+          comp.pred <- reversePCA(comp.pred, Y_pca_result, use_standardized_PCA)
+          comp.ess  <- sum((comp.pred - Y_col_means)^2)  # ESS for the component.
+          perm.r2.components[[comp]][i] <- sqrt(comp.ess / tss)  # √R² for the component, variance explained by this component. The square root here also provides a correlation-like measure for each component.
+        }
         
-        #Pdist
+        # 3d) LANDMARK-WISE √R² under permutation (same methodology as global)
+        if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+          perm.pred.dense <- reverse_pca_dense(full.pred)
+          perm.true.dense <- reverse_pca_dense(Y_before)
+        }else{
+          perm.pred.dense <- full.pred
+          perm.true.dense <- Y_before
+        }
         
-        # Calculate projection of 3 stdev for each permutation
+        # for(lmk in 1:nlandmarks){
+        #   # Extract the 3 columns (x,y,z) for this landmark
+        #   lmk_cols <- ((lmk-1)*3 + 1):(lmk*3)
+          
+        #   # Same ESS/TSS calculation as observed model
+        #   lmk_pred <- perm.pred.dense[, lmk_cols, drop=FALSE]
+        #   lmk_true <- perm.true.dense[, lmk_cols, drop=FALSE]
+        #   lmk_means <- matrix(colMeans(lmk_true), nrow = nrow(lmk_true), ncol = 3, byrow = TRUE)
+          
+        #   ess_lmk <- sum((lmk_pred - lmk_means)^2)
+        #   tss_lmk <- sum((lmk_true - lmk_means)^2)
+          
+        #   perm.r2.landmark[[lmk]][i] <- sqrt(ess_lmk / tss_lmk)  # Store √R² instead of Euclidean error
+        # }
+        # Vectorized landmark calculation
+        pred_reshaped <- array(perm.pred.dense, dim = c(nrow(perm.pred.dense), n_landmarks, 3))
+        true_reshaped <- array(perm.true.dense, dim = c(nrow(perm.true.dense), n_landmarks, 3))
+
+        # Calculate means and expanded means for all landmarks at once
+        lmk_means <- apply(true_reshaped, c(2,3), mean)
+        lmk_means_expanded <- array(rep(lmk_means, each = nrow(perm.true.dense)), 
+                                  dim = c(nrow(perm.true.dense), n_landmarks, 3))
+
+        # Calculate ESS and TSS for all landmarks at once
+        ess_per_landmark <- apply((pred_reshaped - lmk_means_expanded)^2, 2, sum)
+        tss_per_landmark <- apply((true_reshaped - lmk_means_expanded)^2, 2, sum)
+
+        # Store results
+        for(lmk in 1:n_landmarks){
+          perm.r2.landmark[[lmk]][i] <- sqrt(ess_per_landmark[lmk] / tss_per_landmark[lmk])
+        }
+
+        
+        # 3e) Pdist: distance of a 3 SD extrapolated shape to the mean shape
+        # Calculate projection of 3 standard deviations for each permutation
         # Get the mean and standard deviation of the first PLS axis
         mean_score <- apply(process.svd$model$t, 2, mean)
         sd_score <- apply(process.svd$model$t, 2, sd)
         new_score <- matrix(0, ncol = length(mean_score), nrow = 1)
-        new_score[1, ] <- mean_score + 3 * sd_score
+        new_score[1, ] <- mean_score + 3 * sd_score  # Extrapolate 3 standard deviations along the PLS axis.
         
         # Get the coefficient vector from the first response block
         c <- process.svd$model$C
@@ -2132,23 +2612,208 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
         
         if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
           y = reverse_pca_dense(y)
-          pred.shape <- row2array3d(y, Nlandmarks = nlandmarks)
-        }else{
-          pred.shape <- row2array3d(y, Nlandmarks = ncol(Y_before)/3)
-        }
-        
+        }        
+        pred.shape <- row2array3d(y, Nlandmarks = n_landmarks)        
         pred.shape <- pred.shape[,,1]
         
-        perm.pdist.mean[i] <- sqrt(sum((pred.shape - data.mean.shape)^2))
+        perm.pdist.mean[i] <- sqrt(sum((pred.shape - data.mean.shape)^2))  # Distance of the extrapolated shape from the mean shape, providing insight into the variability and extremity of shape changes.
       }
       
+      # ==============================
+      # 4.   OBSERVED (REAL) MODEL
+      # ==============================
       full.pred <- predict(pls.svd, probs.rows)$y
       full.pred = reversePCA(full.pred, Y_pca_result, use_standardized_PCA)
-      Y_col_means = matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow=TRUE)
-      ess <- sum((full.pred - Y_col_means)^2)
-      tss <- sum((Y_before - Y_col_means)^2)
-      perm.r2 <- c(sqrt(ess/tss), perm.result)
-      approximate.p <- sum(sqrt(ess/tss) < perm.result)/length(perm.result)
+      #Y_col_means = matrix(colMeans(Y_before), nrow = nrow(Y_before), ncol = ncol(Y_before), byrow=TRUE)
+      ess <- sum((full.pred - Y_col_means)^2)  # ESS for the observed model.
+      #tss <- sum((Y_before - Y_col_means)^2)   # TSS for the observed data.
+      perm.r2 <- c(sqrt(ess/tss), perm.result)  # Prepend observed √R² to permutation results. The square root provides a correlation measure, connecting variance explained to model fit.
+      approximate.p <- sum(sqrt(ess/tss) < perm.result)/length(perm.result)  # Calculate p-value for the observed model, probability that observed R² is due to chance.
+      approximate.effect.size <- round(abs((sqrt(ess/tss) - mean(perm.result))/sd(perm.result)), 3)
+
+      # ------------------------------
+      # 5.   COMPONENT-LEVEL INFERENCE
+      # ------------------------------
+      for(comp in 1:pls_axis){
+        # Calculate actual R² for this component
+        comp.pred <- pls.svd$model$t[, comp, drop=FALSE] %*% t(pls.svd$model$C[, comp, drop=FALSE])
+        comp.pred <- comp.pred * t(replicate(nrow(comp.pred), pls.svd$model$sdY))
+        comp.pred <- comp.pred + t(replicate(nrow(comp.pred), pls.svd$model$muY))
+        comp.pred <- reversePCA(comp.pred, Y_pca_result, use_standardized_PCA)
+        
+        comp.ess <- sum((comp.pred - Y_col_means)^2)  # ESS for the component.
+        actual.comp.r2 <- sqrt(comp.ess/tss)  # √R² for the component, variance explained by this component. The square root here provides a correlation-like measure for each component.
+        
+        # P-value for component using permutation method
+        component.p.values[comp] <- sum(actual.comp.r2 < perm.r2.components[[comp]]) / length(perm.r2.components[[comp]])  # Probability that the component's effect is due to chance.
+
+        
+        # Effect size for component
+        component.effect.sizes[comp] <- round(abs((actual.comp.r2 - mean(perm.r2.components[[comp]]))/sd(perm.r2.components[[comp]])), 3)  # Standardized effect size for the component, showing the magnitude of the component's effect relative to variability.
+      }
+      
+      
+      # # ------------------------------
+      # # 6.   LANDMARK-LEVEL INFERENCE
+      # # ------------------------------
+      # # Convert back to coordinate space for landmark-wise analysis
+      # if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+      #   full.pred.dense <- reverse_pca_dense(full.pred)
+      #   full.pred.coords <- full.pred.dense
+      #   Y_before.coords <- reverse_pca_dense(Y_before)
+      # }else{
+      #   full.pred.coords <- full.pred
+      #   Y_before.coords <- Y_before
+      # }
+      
+      # landmark.actual.R2 <- numeric(nlandmarks)
+      # for(lmk in 1:nlandmarks){
+      #   # Extract the 3 columns (x,y,z) for this landmark
+      #   lmk_cols <- ((lmk-1)*3 + 1):(lmk*3)
+        
+      #   # Apply same ESS/TSS logic as global model, but only for this landmark's coordinates
+      #   lmk_pred <- full.pred.coords[, lmk_cols, drop=FALSE]
+      #   lmk_true <- Y_before.coords[, lmk_cols, drop=FALSE]
+      #   lmk_means <- matrix(colMeans(lmk_true), nrow = nrow(lmk_true), ncol = 3, byrow = TRUE)
+        
+      #   ess_lmk <- sum((lmk_pred - lmk_means)^2)  # ESS for this landmark
+      #   tss_lmk <- sum((lmk_true - lmk_means)^2)  # TSS for this landmark
+        
+      #   landmark.actual.R2[lmk] <- sqrt(ess_lmk / tss_lmk)  # √R² for this landmark
+        
+      #   # P-value: upper tail (higher √R² is better, same as global and component tests)
+      #   lmk.p <- sum(landmark.actual.R2[lmk] < perm.r2.landmark[[lmk]]) / 
+      #            length(perm.r2.landmark[[lmk]])
+      #   landmark.p.values[lmk] <- lmk.p
+        
+      #   # Effect size (standardized difference)
+      #   landmark.effect.sizes[lmk] <- round(
+      #       abs((landmark.actual.R2[lmk] - mean(perm.r2.landmark[[lmk]])) / 
+      #           sd(perm.r2.landmark[[lmk]])), 3)
+      # }
+      
+      # -------------------------------------------------------------------
+      # 6.   LANDMARK-LEVEL INFERENCE - BENJAMINI-HOCHBERG FDR ADJUSTMENT
+      # -------------------------------------------------------------------
+      # Convert back to coordinate space for landmark-wise analysis
+      if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+        full.pred.dense <- reverse_pca_dense(full.pred)
+        full.pred.coords <- full.pred.dense
+        Y_before.coords <- reverse_pca_dense(Y_before)
+      }else{
+        full.pred.coords <- full.pred
+        Y_before.coords <- Y_before
+      }
+
+
+      landmark.actual.R2 <- numeric(n_landmarks)
+      for(lmk in 1:n_landmarks){
+        # Extract the 3 columns (x,y,z) for this landmark
+        lmk_cols <- ((lmk-1)*3 + 1):(lmk*3)
+
+        # Apply same ESS/TSS logic as global model, but only for this landmark's coordinates
+        lmk_pred <- full.pred.coords[, lmk_cols, drop=FALSE]
+        lmk_true <- Y_before.coords[, lmk_cols, drop=FALSE]
+        lmk_means <- matrix(colMeans(lmk_true), nrow = nrow(lmk_true), ncol = 3, byrow = TRUE)
+
+        ess_lmk <- sum((lmk_pred - lmk_means)^2)  # ESS for this landmark
+        tss_lmk <- sum((lmk_true - lmk_means)^2)  # TSS for this landmark
+
+        landmark.actual.R2[lmk] <- sqrt(ess_lmk / tss_lmk)  # √R² for this landmark
+
+        # P-value: upper tail (higher √R² is better, same as global and component tests)
+        lmk.p <- sum(landmark.actual.R2[lmk] < perm.r2.landmark[[lmk]]) / 
+                 length(perm.r2.landmark[[lmk]])
+        landmark.p.values[lmk] <- lmk.p
+
+        # Effect size (standardized difference)
+        landmark.effect.sizes[lmk] <- round(
+            abs((landmark.actual.R2[lmk] - mean(perm.r2.landmark[[lmk]])) / 
+                sd(perm.r2.landmark[[lmk]])), 3)
+      }
+      
+      # Apply Benjamini-Hochberg FDR adjustment to landmark p-values
+      landmark.p.values.adjusted <- numeric(n_landmarks)
+      
+      # Sort p-values and keep track of original order
+      m <- length(landmark.p.values)
+      p_sorted_indices <- order(landmark.p.values)
+      p_sorted <- landmark.p.values[p_sorted_indices]
+      
+      # Calculate adjusted p-values using BH procedure
+      q_prime <- p_sorted * m / (1:m)  # p(i) * m/i for each sorted p-value
+      
+      # Apply step-down procedure: work backwards to ensure monotonicity
+      adjusted_sorted <- numeric(m)
+      adjusted_sorted[m] <- q_prime[m]  # Last (largest) p-value
+      
+      for(i in (m-1):1){
+        adjusted_sorted[i] <- min(adjusted_sorted[i+1], q_prime[i])
+      }
+      
+      # Ensure adjusted p-values don't exceed 1
+      adjusted_sorted <- pmin(adjusted_sorted, 1)
+      
+      # Map back to original order
+      landmark.p.values[p_sorted_indices] <- adjusted_sorted
+
+      
+      # Debug visualization: plot landmarks colored by p-value gradient
+      if(DEBUG){ # Set to TRUE to enable debug visualization
+        
+        # Get mean shape for visualization
+        if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+          Y_before.array <- row2array3d(reverse_pca_dense(Y_before), Nlandmarks = nlandmarks)
+        }else{
+          Y_before.array <- row2array3d(Y_before, Nlandmarks = ncol(Y_before)/3)
+        }
+        mean.shape <- apply(Y_before.array, c(1,2), mean)
+        
+        # Create gradient based on actual p-value range (0 to max observed)
+        max_p <- max(landmark.p.values, na.rm = TRUE)
+        min_p <- 0  # Always start from 0 for p-values
+        
+        # Color gradient: green (p=0, most significant) to red (p=max, least significant)
+        colors <- colorRampPalette(c("darkgreen", "green", "yellow", "orange", "red"))(100)
+        
+        # Scale p-values to [0,1] based on actual range
+        if(max_p > min_p){
+          p.values.scaled <- (landmark.p.values - min_p) / (max_p - min_p)
+        } else {
+          p.values.scaled <- rep(0, length(landmark.p.values))  # All p-values are the same
+        }
+        
+        # Map to color indices (1-100)
+        color.indices <- pmax(1, pmin(100, ceiling(p.values.scaled * 99) + 1))
+        
+        # Open 3D window
+        open3d()
+        
+        # Plot landmarks with gradient colors
+        for(lmk in 1:nlandmarks){
+          points3d(mean.shape[lmk,1], mean.shape[lmk,2], mean.shape[lmk,3], 
+                   col=colors[color.indices[lmk]], size=10)
+        }
+        
+        # Create informative legend with actual p-value ranges
+        legend_p_values <- c(min_p, max_p/4, max_p/2, 3*max_p/4, max_p)
+        legend_labels <- sprintf("p = %.3f", legend_p_values)
+        legend_colors <- colors[c(1, 25, 50, 75, 100)]
+        
+        legend3d("topright", 
+                 legend = legend_labels,
+                 col = legend_colors, 
+                 pch = 16, 
+                 cex = 1.2)
+        
+        title3d(main = sprintf("Landmarks colored by p-value (0 to %.3f)", max_p))
+        
+        # Print summary statistics
+        cat(sprintf("P-value range: %.4f to %.4f\n", min(landmark.p.values), max(landmark.p.values)))
+        cat(sprintf("Mean p-value: %.4f\n", mean(landmark.p.values)))
+        cat(sprintf("Significant landmarks (p < 0.05): %d/%d\n", 
+                    sum(landmark.p.values < 0.05), length(landmark.p.values)))
+      }
     }
     
     
@@ -2159,17 +2824,30 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
     rangenes.coherence <- -1
     rangenes.coherence.shapes <- -1
     if(doRangenes){
-      if(as.numeric(rangenes)>200){
-        rangenes = 200
+      if(as.numeric(rangenes)>5000){
+        rangenes = 5000
       }else if(as.numeric(rangenes)<2){
         rangenes = 2
       }
       rangenes.result <- rep(NA, rangenes)
       
-      rangenes.coherence.shapes <- array(NA, dim = c(length(rangenes.result), ncol(Yshapes) / 3, 3)) 
+      if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+        rangenes.coherence.shapes <- array(NA, dim = c(length(rangenes.result), nlandmarks, 3)) 
+      }else{
+        rangenes.coherence.shapes <- array(NA, dim = c(length(rangenes.result), ncol(Y_before) / 3, 3)) 
+      }
       
       # Mean shape of data
-      Y_mat = row2array3d(Yshapes, Nlandmarks = ncol(Y_before)/3)
+      YshapesReversed = reversePCA(Yshapes, Y_pca_result,  use_standardized_PCA)      
+      
+      # If human dense landmarks, reverse pca dense
+      if (pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+        YshapesReversed = reverse_pca_dense(YshapesReversed)
+        Y_mat = row2array3d(YshapesReversed, Nlandmarks = nlandmarks)
+      }else{
+        Y_mat = row2array3d(YshapesReversed, Nlandmarks = ncol(Y_before)/3)
+      }
+
       data.mean.shape <- apply(Y_mat, c(1,2), mean)
       k=1
       while(k <= length(rangenes.result)){
@@ -2178,17 +2856,20 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
             # Start randomizing the gene selection
             # select the ENSEMBL and SYMBOL columns from the org.Mm.eg.db object
             if(pheno %in% pheno_names_human){
-              curated_genes <- get_curated_gene_list_human()
+              curated_genes <- get_curated_gene_list_human(pheno)
             }else{
               curated_genes <- get_curated_gene_list()
             }
-            rangenes.gene2symbol <- curated_genes[sample(nrow(curated_genes), length(selection.vector)), ]
+            cat(length(gene.names), "\n")
+            cat(length(selection.vector), "\n")
+            rangenes.gene2symbol <- curated_genes[sample(nrow(curated_genes), length(gene.names)), ]
+            cat(length(rangenes.gene2symbol$SYMBOL), "\n")
           
             # #FIND ALL FAULTY GENES
             # coi2 <- c("TXCHROM", "TXSTART", "TXEND")
             # faultyGenes <- list()
             # # Record the start time
-            # start_time <- Sys.time()
+            # start_time <- Sys.time()ss
             # elapsed_times <- c()
             # convert_seconds <- function(seconds) {
             #   hours <- floor(seconds / 3600)
@@ -2246,10 +2927,47 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
             
             coi2 <- c("TXCHROM", "TXSTART", "TXEND")
             if(pheno %in% pheno_names_human){
-              print(rangenes.gene2symbol[,1]$SYMBOL)
-              res = getHumanGenomeXTesting(rangenes.gene2symbol[,1]$SYMBOL, "custom", pheno, Yshapes)
-              random.probs.rows = res[[1]]
-              random.gene.names = res[[2]]
+
+              # Get genotypes + already-synchronised phenotypes for the
+              # random gene set;  getHumanGenomeX() guarantees that
+              # random.probs.rows and the returned Y matrix have identical
+              # rows / subjects.
+              res = getHumanGenomeX(rangenes.gene2symbol$SYMBOL,"custom", pheno, Yshapes_original, single_match = TRUE)
+              random.probs.rows  <- res[[1]]
+              Yshapes_for_random <- res[[3]]
+
+              cat("Yshapes_for_random: ", dim(Yshapes_for_random), "\n")
+              cat("random.probs.rows: ", dim(random.probs.rows), "\n")
+             
+              stddPCA_rand = standardizePCA(Yshapes_for_random, use_standardized_PCA, 97)
+              Yshapes_rand_pca = stddPCA_rand$Yshapes
+              Y_pca_result_rand = stddPCA_rand$Y_pca_result
+
+              process.svd <- ddsPLS(X = random.probs.rows, Y = Yshapes_rand_pca, lambdas = rep(lambda, pls_axis), NCORES=6, verbose=TRUE, doBoot = FALSE)
+
+              mean_score <- apply(process.svd$model$t, 2, mean)
+              sd_score <- apply(process.svd$model$t, 2, sd)
+              new_score <- matrix(0, ncol = length(mean_score), nrow = 1)
+              new_score[1, ] <- mean_score + 3 * sd_score
+              
+              c <- process.svd$model$C
+              y <- new_score %*% t(c)
+              y = y * t(process.svd$model$sdY)
+              y = (y + t(process.svd$model$muY))
+              
+              y = reversePCA(y, Y_pca_result_rand, use_standardized_PCA)
+
+              if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
+                y = reverse_pca_dense(y)
+                cat("y: ", dim(y), "\n")
+                cat("nlandmarks: ", nlandmarks, "\n")
+                cat("y before: ", dim(Y_before), "\n")
+                pred.shape <- row2array3d(y, Nlandmarks = nlandmarks)
+              }else{
+                cat("y: ", dim(y), "\n")
+                cat("ncol(Y_before)/3: ", ncol(Y_before)/3, "\n")
+                pred.shape <- row2array3d(y, Nlandmarks = ncol(Y_before)/3)
+              }
             }else{
               suppressMessages(symbol2info <- AnnotationDbi::select(mmusculusEnsembl, keys = rangenes.gene2symbol[,2]$ENSEMBL, columns = coi2, keytype="GENEID"))
               transcipt.size <- abs(symbol2info[,3] - symbol2info[,4])
@@ -2299,47 +3017,39 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
                   random.probs.rows[, probrowseq[i]:(probrowseq[i+1] - 1)] <- as.matrix(collect(tbl(pheno_table, seq.indexes[i, 2])))
                 }
               }
-            }
-            
-            process.svd <- ddsPLS(X = random.probs.rows, Y = Yshapes, lambdas = rep(lambda, pls_axis), NCORES=6, verbose=TRUE, doBoot = FALSE)
 
-            # Calculate projection of 3 stdev for each randomization
-            # Get the mean and standard deviation of the PLS axes
-            mean_score <- apply(process.svd$model$t, 2, mean)
-            sd_score <- apply(process.svd$model$t, 2, sd)
-            new_score <- matrix(0, ncol = length(mean_score), nrow = 1)
-            new_score[1, ] <- mean_score + 3 * sd_score
-            
-            # Get the coefficient vector from the first response block
-            c <- process.svd$model$C
-            
-            # Perform the prediction
-            y <- new_score %*% t(c)
-            y = y * t(process.svd$model$sdY)
-            y = (y + t(process.svd$model$muY))
-            
-            y = reversePCA(y, Y_pca_result, use_standardized_PCA)
-            
-            if(pheno == "YHumanDense" || pheno == "YHumanTANZDense"){
-              y = reverse_pca_dense(y)
-              pred.shape <- row2array3d(y, Nlandmarks = nlandmarks)
-            }else{
+              process.svd <- ddsPLS(X = random.probs.rows, Y = Yshapes, lambdas = rep(lambda, pls_axis), NCORES=6, verbose=TRUE, doBoot = FALSE)
+
+              mean_score <- apply(process.svd$model$t, 2, mean)
+              sd_score <- apply(process.svd$model$t, 2, sd)
+              new_score <- matrix(0, ncol = length(mean_score), nrow = 1)
+              new_score[1, ] <- mean_score + 3 * sd_score
+              
+              c <- process.svd$model$C
+              y <- new_score %*% t(c)
+              y = y * t(process.svd$model$sdY)
+              y = (y + t(process.svd$model$muY))
+              
+              y = reversePCA(y, Y_pca_result, use_standardized_PCA)
+              
               pred.shape <- row2array3d(y, Nlandmarks = ncol(Y_before)/3)
             }
             
             pred.shape <- pred.shape[,,1]
+
+            cat("pred.shape: ", dim(pred.shape), "\n")
+            cat("rangenes.coherence.shapes: ", dim(rangenes.coherence.shapes), "\n")
             
             rangenes.coherence.shapes[k,,] <- pred.shape
             k = k + 1
           },error = function(cond) {
             if(pheno %in% pheno_names_human){
-              message(rangenes.gene2symbol[,1]$SYMBOL)
+              message(paste(rangenes.gene2symbol$SYMBOL, collapse=", "))
             }else{
               matched_symbol <- subset(rangenes.gene2symbol, ENSEMBL==unique(symbol2info$GENEID[i]), select = SYMBOL)$SYMBOL
               message(paste("skipping ", k, " - gene at fault: ", matched_symbol))
-              message(conditionMessage(cond))
             }
-            # Choose a return value in case of error
+            message(conditionMessage(cond))
           },
           warning = function(cond) {
             message(conditionMessage(cond))
@@ -2791,15 +3501,30 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
     displacement_max = max(displacement)
     
     if(doPermutation){
-      #p_vs_scrambledsubjects = approximate.p
-      #esize_vs_scrambledsubjects = round(abs((procrustes_dist - mean(perm.pdist.mean))/(sd(perm.pdist.mean))), 3)
-      p_vs_scrambledsubjects = pnorm(q = perm.r2[1], mean=mean(perm.result), sd=sd(perm.result), lower.tail = FALSE)#approximate.p
-      p_vs_scrambledsubjects = ifelse(p_vs_scrambledsubjects < 0.0001, sprintf("%.2e", p_vs_scrambledsubjects), as.character(round(p_vs_scrambledsubjects, digits = 4)))
-      esize_vs_scrambledsubjects = round(abs((perm.r2[1]-mean(perm.result))/sd(perm.result)), 3)
+      # Global permutation results (using pre-calculated empirical p-value)
+      p_vs_scrambledsubjects = ifelse(approximate.p < 0.0001, sprintf("%.2e", approximate.p), as.character(round(approximate.p, digits = 4)))
+      esize_vs_scrambledsubjects = approximate.effect.size
+      
+      # Component-wise permutation results
+      p_vs_scrambledsubjects_components = sapply(component.p.values, function(p) {
+        ifelse(p < 0.0001, sprintf("%.2e", p), as.character(round(p, digits = 4)))
+      })
+      esize_vs_scrambledsubjects_components = component.effect.sizes
+      
+      # Landmark-wise permutation results  
+      p_vs_scrambledsubjects_landmarks = landmark.p.values
+      esize_vs_scrambledsubjects_landmarks = landmark.effect.sizes
+      
     }else{
       p_vs_scrambledsubjects = -1
       esize_vs_scrambledsubjects = -1
+      p_vs_scrambledsubjects_components = -1
+      esize_vs_scrambledsubjects_components = -1
+      p_vs_scrambledsubjects_landmarks = -1
+      esize_vs_scrambledsubjects_landmarks = -1
     }
+
+
     
     # rangenes.coherence
     if(doRangenes){
@@ -2822,12 +3547,17 @@ custom.mgp <- function(genelist = c("Bmp7", "Bmp2", "Bmp4", "Ankrd11"), Yshapes,
     }
     
     return(list(loadings = loadings_list, pheno1 = proj.coords_components_a1, pheno2 = proj.coords_components_a2, 
-                pheno_loadings = t(pls.svd$model$C), p_value = approximate.p, 
-                perm_r2 = perm.r2, perm_pdist_mean = perm.pdist.mean,
-                variance_explained = variance_explained, BIC=BIC, genelist=gene.names, regression_error=regression_error,
-                pls_mag=pls_mag, procrustes_dist=procrustes_dist, displacement_mean=displacement_mean, displacement_max=displacement_max,
-                p_vs_rangenes=p_vs_rangenes, p_vs_scrambledsubjects=p_vs_scrambledsubjects, esize_vs_rangenes=esize_vs_rangenes,
-                esize_vs_scrambledsubjects=esize_vs_scrambledsubjects, histogram_df=histogram_df))
+            pheno_loadings = t(pls.svd$model$C), p_value = approximate.p, 
+            perm_r2 = perm.r2, perm_pdist_mean = perm.pdist.mean,
+            variance_explained = variance_explained, BIC=BIC, genelist=gene.names, regression_error=regression_error,
+            pls_mag=pls_mag, procrustes_dist=procrustes_dist, displacement_mean=displacement_mean, displacement_max=displacement_max,
+            p_vs_rangenes=p_vs_rangenes, p_vs_scrambledsubjects=p_vs_scrambledsubjects, esize_vs_rangenes=esize_vs_rangenes,
+            esize_vs_scrambledsubjects=esize_vs_scrambledsubjects, 
+            p_vs_scrambledsubjects_components=p_vs_scrambledsubjects_components,
+            esize_vs_scrambledsubjects_components=esize_vs_scrambledsubjects_components,
+            p_vs_scrambledsubjects_landmarks=p_vs_scrambledsubjects_landmarks,
+            esize_vs_scrambledsubjects_landmarks=esize_vs_scrambledsubjects_landmarks,
+            histogram_df=histogram_df))
 }
 
 #set CORS parameters####
@@ -2849,7 +3579,7 @@ cors <- function(res) {
 #* @param pls_axis how many axes to return
 #* @param pheno what phenotype to use
 #* @param remove_pc1 should pc1 of pheno be removed
-#* @param permutation how many permutations should we use for testing? Max 200.
+#* @param permutation how many permutations should we use for testing? Max 5000.
 #* @get /mgp
 
 function(GO.term = "chondrocyte differentiation", lambda = .06, pls_axis = 1, pheno = "Y", pheno_index = "1:54", permutation = 0, remove_pc1 = F, use_standardized_PCA=F, doPermutation = F, rangenes = 0, doRangenes = F) {
@@ -3129,76 +3859,309 @@ GO_ensembl_join <- right_join(DO.go, ensembl2go, by = c("V2" = "GO"))
 })
 }
 
+
+#### KRISTEN ####
+
+# Add a conditional here: give a parameter pheno; and then return list of unique mutants
+
+# Alejandro, here are the actual names
+# Note that generation is not a variable in the mutants, only DO
+pheno_names_mouse_groups_mutants <- list(
+  "Manual" = c("Y"),
+  "Automated" = c(
+    "A_lm_raw",
+    "A_lm_age",
+    "A_lm_sex",
+    "F_lm_age",
+    "M_lm_age",
+    "A_lm_age_sex",
+    "A_lm_age_sex_size",
+    "A_lm_age_size",
+    "F_lm_age_size",
+    "M_lm_age_size",
+    "A_lm",
+    "F_lm",
+    "M_lm")
+)
+
+# mappings for equivalent pheno to mutant pheno groups
+pheno_names_mouse_groups_mutants_equivalences <- c(
+  "A_lm_raw" = "A_lm_raw",
+  "A_lm_gen" = "A_lm_age",
+  "A_lm_gen_sex" = "A_lm_age_sex",
+  "F_lm_gen" = "F_lm_age",
+  "M_lm_gen" = "M_lm_age",
+  "A_lm_gen_sex_size" = "A_lm_age_sex_size",
+  "A_lm_gen_size" = "A_lm_age_size",
+  "F_lm_gen_size" = "F_lm_age_size",
+  "M_lm_gen_size" = "M_lm_age_size",
+  "A_lm" = "A_lm",
+  "F_lm" = "F_lm",
+  "M_lm" = "M_lm",
+  "Y" = "Y"
+)
+
+pheno_names_mouse_mutants <- list(
+  "Manual" = c("mutant.db", "mutant.lms"),
+  "Automated" = c("auto.mutant.db", "auto.mutant.lms")
+)
+
+
 #* Get the list of mutants to make comparisons with
+#* @param pheno Phenotype name. Determines which mutant DB to use.
 #* @get /mutant_list
-function(){
-  # Generating a future promise for asynchronous processing
-  future_promise({
-    # Extracting unique genotypes from the mutant database and converting them to character
-    as.character(unique(mutant.db$Genotype))
-  })
+function(pheno = NULL){
+  print(paste("pheno: ", pheno))
+  
+  # Check that pheno is provided
+  if(is.null(pheno)) {
+    stop("Parameter 'pheno' must be specified.")
+  }
+  
+  # Determine group (Manual or Automated) based on phenotype
+  group <- NULL
+  for(grp in names(pheno_names_mouse_groups)) {
+    if(pheno %in% pheno_names_mouse_groups[[grp]]) {
+      group <- grp
+      break
+    }
+  }
+  if(is.null(group)){
+    # Return a descriptive list if pheno is not found but specified
+    return(c("No mutants found for phenotype: " = pheno))
+  }
+  
+  # Get the appropriate mutant database variable name
+  mutant_db_name <- pheno_names_mouse_mutants[[group]][1]
+  
+  if(!exists(mutant_db_name, inherits = TRUE)){
+    stop(sprintf("Mutant database '%s' not found in environment.", mutant_db_name))
+  }
+  mutant_db <- get(mutant_db_name, inherits = TRUE)
+  
+  # Ensure mutant_db has a Genotype column
+  if(!"Genotype" %in% colnames(mutant_db)){
+    stop("The mutant database does not contain a 'Genotype' column.")
+  }
+  
+  # Return unique genotypes as character vector
+  as.character(unique(mutant_db$Gene))
 }
+
 
 #* Calculate correlation between mutant vector and MGP vector
-#* @param MGP_pheno_loadings Phenotype loadings from MGP model
 #* @param mutant Selected mutant from /mutant_list
-#* @get /mutant_comparison
-function(MGP_pheno_loadings = NULL, mutant = "Bmp2"){
+#* @param pheno Selected phenotype
+#* @param pheno_index Range of landmarks to use (e.g., "1:54")
+#* @param pheno_diff Shape difference between -3 and +3 standard deviations from the population mean on each component
+#* @post /mutant_comparison
+function(mutant = NULL, pheno="A_lm_gen_sex_size", pheno_index="1:93", pheno_diff=NULL){
 
-  print(mutant)
-  # Converting MGP phenotype loadings from string to numeric array
-  MGP_pheno_loadings <- as.numeric(MGP_pheno_loadings)
-  
-  # Extracting landmark coordinates for the selected mutant
-  tmp.mutant.registration <- geomorph::gpagen(geomorph::arrayspecs(rbind(Y, as.matrix(mutant.lms[mutant.db$Genotype == mutant,])), 54, 3))$coords
-  
-  # Calculating loadings for the mutant
-  mutant.loadings <- as.numeric(manova(geomorph::two.d.array(tmp.mutant.registration) ~ c(rep(0, nrow(Y)), rep(1, sum(mutant.db$Genotype == mutant))))$coef[2,])
+  if (is.null(pheno_diff)) {
+    pheno_diff <- matrix(c(
+      -0.00040, 0.00040, 0.00020, -0.00040, -0.00040, 0.00020, -0.00040, 0.00030, 0.00010, -0.00040, -0.00030, 0.00010, 0.00040, 0.00010, 0.00050, 0.00040, -0.00010, 0.00050, -0.00050, 0.00000, 0.00050, 0.00010, -0.00000, -0.00050, 0.00010, -0.00000, -0.00020, -0.00030, -0.00000, -0.00060, -0.00030, 0.00000, -0.00060, -0.00020, 0.00000, 0.00020, -0.00020, 0.00010, 0.00030, -0.00020, -0.00010, 0.00030, 0.00050, 0.00020, 0.00020, 0.00050, -0.00020, 0.00020, 0.00030, 0.00030, 0.00030, 0.00030, -0.00030, 0.00030, 0.00030, 0.00080, 0.00000, 0.00030, -0.00080, 0.00000, -0.00040, 0.00060, 0.00010, 0.00000, -0.00060, 0.00010, 0.00110, 0.00000, -0.00090, 0.00110, 0.00000, -0.00090, 0.00070, 0.00000, -0.00020, 0.00070, 0.00000, -0.00020, 0.00020, -0.00040, 0.00000, 0.00020, 0.00040, 0.00000, 0.00030, -0.00050, 0.00000, 0.00030, 0.00050, 0.00000, 0.00030, -0.00020, 0.00020, 0.00030, 0.00020, 0.00020, 0.00060, -0.00020, 0.00010, 0.00060, 0.00020, 0.00010, 0.00040, -0.00020, 0.00040, 0.00040, 0.00020, 0.00040, 0.00020, -0.00020, 0.00060, 0.00020, 0.00020, 0.00060, 0.00040, -0.00050, 0.00060, 0.00040, 0.00050, 0.00060, 0.00030, -0.00070, 0.00060, 0.00030, 0.00070, 0.00060, -0.00010, -0.00010, 0.00050, -0.00010, 0.00010, 0.00050, 0.00000, -0.00050, 0.00050, 0.00000, 0.00050, 0.00050, 0.00030, -0.00090, 0.00050, 0.00030, 0.00090, 0.00050, 0.00030, -0.00030, 0.00040, 0.00030, 0.00030, 0.00040, 0.00000, -0.00070, 0.00020, 0.00000, 0.00070, 0.00020, -0.00010, 0.00000, 0.00020, -0.00010, 0.00000, 0.00020, -0.00020, 0.00010, 0.00010, -0.00020, -0.00010, 0.00010, -0.00060, 0.00010, -0.00030, -0.00060, -0.00010, -0.00030, 0.00090, -0.00010, -0.00080, 0.00090, 0.00010, -0.00080, 0.00030, -0.00030, 0.00030, 0.00010, -0.00100, 0.00020, 0.00000, -0.00110, 0.00040, -0.00030, -0.00050, 0.00000, -0.00050, -0.00040, -0.00010, 0.00110, 0.00010, -0.00070, 0.00110, -0.00010, -0.00070, 0.00030, 0.00030, 0.00030, 0.00010, 0.00100, 0.00020, 0.00000, 0.00110, 0.00040, -0.00030, 0.00050, 0.00000, -0.00050, 0.00040, -0.00010, -0.00070, 0.00000, -0.00020, -0.00030, -0.00000, 0.00030, -0.00040, 0.00000, 0.00070, -0.00040, 0.00000, 0.00070, -0.00050, 0.00000, 0.00020, 0.00090, 0.00000, -0.00120, -0.00030, 0.00040, 0.00000, 0.00040, -0.00020, 0.00000, 0.00040, 0.00020, 0.00000, 0.00030, -0.00010, 0.00040, 0.00060, -0.00020, 0.00050, 0.00060, -0.00020, 0.00060, 0.00030, 0.00010, 0.00040, 0.00060, 0.00020, 0.00050, 0.00060, 0.00020, 0.00060, 0.00090, 0.00000, -0.00080, -0.00030, -0.00030, 0.00010, -0.00030, 0.00030, 0.00010, -0.00030, -0.00040, 0.00000, 0.00000, -0.00030, -0.00020, 0.00000, 0.00030, -0.00020,
+      -0.00030, 0.00040, 0.00020, -0.00030, -0.00040, 0.00020, -0.00020, 0.00040, 0.00040, -0.00020, -0.00040, 0.00040, 0.00000, 0.00000, 0.00020, 0.00000, 0.00000, 0.00020, -0.00010, 0.00000, 0.00000, -0.00010, -0.00000, -0.00030, 0.00000, -0.00000, -0.00010, -0.00030, -0.00000, -0.00040, -0.00030, -0.00000, -0.00050, -0.00010, 0.00000, -0.00020, -0.00010, 0.00000, -0.00010, -0.00010, 0.00000, -0.00010, 0.00030, 0.00020, 0.00000, 0.00030, -0.00020, 0.00000, 0.00030, 0.00030, 0.00010, 0.00030, -0.00030, 0.00010, 0.00050, 0.00040, 0.00000, 0.00050, -0.00040, 0.00000, -0.00020, 0.00040, -0.00030, -0.00020, -0.00040, -0.00030, 0.00090, 0.00000, -0.00010, 0.00090, 0.00000, -0.00010, 0.00070, -0.00010, 0.00000, 0.00070, 0.00010, 0.00000, 0.00020, -0.00040, 0.00020, 0.00020, 0.00040, 0.00020, 0.00030, -0.00030, 0.00000, 0.00030, 0.00030, 0.00000, 0.00050, -0.00020, 0.00010, 0.00050, 0.00020, 0.00010, 0.00070, -0.00010, -0.00010, 0.00070, 0.00010, -0.00010, 0.00060, -0.00010, 0.00000, 0.00060, 0.00010, 0.00000, 0.00040, -0.00020, 0.00000, 0.00040, 0.00020, 0.00000, 0.00060, -0.00040, 0.00010, 0.00060, 0.00040, 0.00010, 0.00040, -0.00050, 0.00010, 0.00040, 0.00050, 0.00010, 0.00010, -0.00010, 0.00010, 0.00010, 0.00010, 0.00010, 0.00000, -0.00050, 0.00010, 0.00000, 0.00050, 0.00010, 0.00000, -0.00080, 0.00000, 0.00000, 0.00080, 0.00000, 0.00000, -0.00020, 0.00030, 0.00000, 0.00020, 0.00030, -0.00020, -0.00070, 0.00040, -0.00020, 0.00070, 0.00040, -0.00010, 0.00000, 0.00020, -0.00010, 0.00000, 0.00020, -0.00010, -0.00010, 0.00030, -0.00010, 0.00010, 0.00030, -0.00030, 0.00000, 0.00020, -0.00030, 0.00000, 0.00020, 0.00090, -0.00010, -0.00020, 0.00090, 0.00010, -0.00020, 0.00010, -0.00020, 0.00010, -0.00010, -0.00070, -0.00020, -0.00020, -0.00090, -0.00010, -0.00030, -0.00050, 0.00010, -0.00030, -0.00040, 0.00010, 0.00090, 0.00000, -0.00010, 0.00090, 0.00000, -0.00010, 0.00010, 0.00020, 0.00010, -0.00010, 0.00070, -0.00020, -0.00020, 0.00090, -0.00010, -0.00030, 0.00050, 0.00010, -0.00030, 0.00040, 0.00010, -0.00020, 0.00000, 0.00020, -0.00010, -0.00000, 0.00030, -0.00010, 0.00000, 0.00020, -0.00020, 0.00000, 0.00010, -0.00020, 0.00000, -0.00020, 0.00090, 0.00000, -0.00020, -0.00030, 0.00050, 0.00020, 0.00040, -0.00030, 0.00020, 0.00040, 0.00030, 0.00020, 0.00050, -0.00010, 0.00000, 0.00070, -0.00010, 0.00000, 0.00070, -0.00020, 0.00010, 0.00050, 0.00010, 0.00000, 0.00070, 0.00010, 0.00000, 0.00070, 0.00020, 0.00010, 0.00090, 0.00000, -0.00020, -0.00020, -0.00050, 0.00020, -0.00020, 0.00050, 0.00020, -0.00030, -0.00050, 0.00020, -0.00020, -0.00040, 0.00000, -0.00020, 0.00040, 0.00000,
+      -0.00010, 0.00000, 0.00000, -0.00010, 0.00000, 0.00000, -0.00020, -0.00010, -0.00020, -0.00020, 0.00010, -0.00020, 0.00000, 0.00000, 0.00020, 0.00000, 0.00000, 0.00020, -0.00030, 0.00000, 0.00030, 0.00010, -0.00000, -0.00010, 0.00020, 0.00000, 0.00000, 0.00010, -0.00000, 0.00000, 0.00030, 0.00000, 0.00000, 0.00010, 0.00000, 0.00020, 0.00010, 0.00000, 0.00010, 0.00010, 0.00000, 0.00010, 0.00020, 0.00000, 0.00010, 0.00020, 0.00000, 0.00010, 0.00010, 0.00000, 0.00010, 0.00010, 0.00000, 0.00010, -0.00010, 0.00040, 0.00000, -0.00010, -0.00040, 0.00000, 0.00020, 0.00000, 0.00010, 0.00020, 0.00000, 0.00010, -0.00010, 0.00000, -0.00010, -0.00010, 0.00000, -0.00010, -0.00030, 0.00000, 0.00020, -0.00030, 0.00000, 0.00020, -0.00020, -0.00010, -0.00010, -0.00020, 0.00010, -0.00010, -0.00010, -0.00020, 0.00010, -0.00010, 0.00020, 0.00010, -0.00030, 0.00000, 0.00030, -0.00030, 0.00000, 0.00030, -0.00010, -0.00010, 0.00030, -0.00010, 0.00010, 0.00030, -0.00020, 0.00000, 0.00040, -0.00020, 0.00000, 0.00040, -0.00020, 0.00000, 0.00040, -0.00020, 0.00000, 0.00040, -0.00020, -0.00010, 0.00060, -0.00020, 0.00010, 0.00060, -0.00020, -0.00010, 0.00040, -0.00020, 0.00010, 0.00040, -0.00010, 0.00000, 0.00010, -0.00010, 0.00000, 0.00010, 0.00000, 0.00000, 0.00030, 0.00000, 0.00000, 0.00030, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, -0.00010, -0.00010, 0.00000, 0.00010, -0.00010, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, -0.00010, 0.00000, 0.00000, -0.00010, 0.00000, 0.00000, -0.00020, 0.00020, -0.00020, -0.00020, -0.00020, -0.00020, -0.00040, 0.00010, -0.00050, -0.00040, -0.00010, -0.00050, -0.00020, 0.00000, -0.00010, -0.00020, 0.00000, -0.00010, 0.00010, 0.00000, 0.00010, -0.00020, -0.00010, 0.00010, -0.00010, -0.00010, 0.00020, -0.00010, 0.00010, -0.00010, -0.00010, 0.00000, -0.00020, -0.00030, 0.00000, -0.00010, -0.00030, 0.00000, -0.00010, 0.00010, 0.00000, 0.00010, -0.00020, 0.00010, 0.00010, -0.00010, 0.00010, 0.00020, -0.00010, -0.00010, -0.00010, -0.00010, 0.00000, -0.00020, -0.00030, 0.00000, -0.00040, -0.00020, 0.00000, 0.00010, 0.00000, 0.00000, 0.00020, 0.00000, 0.00000, 0.00030, 0.00000, -0.00000, 0.00020, -0.00030, 0.00000, -0.00020, -0.00010, -0.00010, -0.00010, -0.00020, 0.00000, 0.00020, -0.00020, 0.00000, 0.00020, -0.00030, -0.00010, 0.00040, -0.00020, -0.00010, 0.00050, -0.00020, 0.00000, 0.00060, -0.00030, 0.00010, 0.00040, -0.00020, 0.00010, 0.00050, -0.00020, 0.00000, 0.00060, -0.00030, -0.00000, 0.00000, -0.00020, 0.00010, -0.00010, -0.00020, -0.00010, -0.00010, -0.00010, 0.00010, -0.00010, 0.00010, 0.00010, -0.00020, 0.00010, -0.00010, -0.00020,
+      -0.00010, 0.00000, 0.00000, -0.00010, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00040, 0.00000, 0.00010, 0.00040, 0.00000, 0.00010, -0.00010, -0.00000, 0.00010, 0.00010, -0.00000, 0.00000, 0.00000, -0.00000, -0.00010, -0.00010, -0.00000, -0.00020, -0.00030, -0.00000, 0.00000, -0.00020, -0.00000, 0.00020, -0.00020, 0.00000, 0.00010, -0.00020, 0.00000, 0.00010, 0.00010, 0.00000, 0.00010, 0.00010, 0.00000, 0.00010, -0.00010, 0.00010, 0.00010, -0.00010, -0.00010, 0.00010, 0.00010, 0.00010, 0.00000, 0.00010, -0.00010, 0.00000, -0.00040, 0.00020, 0.00030, 0.00000, -0.00020, 0.00030, 0.00030, 0.00000, -0.00070, 0.00030, 0.00000, -0.00070, 0.00030, 0.00000, -0.00040, 0.00030, 0.00000, -0.00040, 0.00020, 0.00010, -0.00010, 0.00020, -0.00010, -0.00010, 0.00000, 0.00010, -0.00020, 0.00000, -0.00010, -0.00020, 0.00010, 0.00000, -0.00020, 0.00010, 0.00000, -0.00020, 0.00010, 0.00000, -0.00010, 0.00010, 0.00000, -0.00010, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, -0.00010, 0.00000, 0.00010, -0.00010, 0.00000, 0.00010, 0.00010, -0.00010, 0.00010, 0.00010, 0.00010, 0.00010, 0.00030, -0.00010, 0.00050, 0.00030, 0.00010, 0.00050, 0.00030, 0.00000, 0.00010, 0.00030, 0.00000, 0.00010, 0.00020, 0.00000, 0.00000, 0.00020, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, 0.00010, 0.00000, 0.00000, 0.00030, 0.00000, -0.00050, 0.00030, 0.00000, -0.00050, -0.00010, -0.00010, 0.00020, 0.00030, -0.00010, 0.00020, 0.00030, -0.00010, 0.00020, 0.00010, -0.00010, 0.00000, -0.00010, 0.00000, 0.00000, 0.00040, 0.00010, -0.00050, 0.00040, -0.00010, -0.00050, -0.00010, 0.00010, 0.00020, 0.00030, 0.00010, 0.00020, 0.00030, 0.00010, 0.00020, 0.00010, 0.00010, 0.00000, -0.00010, 0.00000, 0.00000, -0.00010, 0.00000, 0.00000, 0.00000, -0.00000, 0.00010, -0.00020, 0.00000, 0.00020, -0.00040, 0.00000, 0.00030, -0.00030, -0.00000, 0.00020, 0.00030, 0.00000, -0.00080, 0.00010, -0.00010, 0.00000, 0.00020, 0.00010, -0.00020, 0.00020, -0.00010, -0.00020, 0.00000, 0.00000, 0.00000, 0.00020, 0.00000, -0.00010, 0.00010, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00020, 0.00000, -0.00010, 0.00010, 0.00000, 0.00000, 0.00030, 0.00000, -0.00060, 0.00000, 0.00010, -0.00010, 0.00000, -0.00010, -0.00010, 0.00010, 0.00010, 0.00000, 0.00010, -0.00010, -0.00010, 0.00010, 0.00010, -0.00010
+    ), nrow = 4, byrow = TRUE)
+  }
 
-  # Creating new copy of mutant.lms called mutant.lms.fixed
-  mutant.loadings.fixed <- mutant.loadings
-  
-  # Swapping relative columns 17 and 18 (each landmark has x,y,z coordinates)
-  relative_column_17 <- c(17*3-2, 17*3-1, 17*3)  # Indices for landmark 17
-  relative_column_18 <- c(18*3-2, 18*3-1, 18*3)  # Indices for landmark 18
-  # Swap the values using vector indexing
-  temp <- mutant.loadings.fixed[relative_column_17]
-  mutant.loadings.fixed[relative_column_17] <- mutant.loadings.fixed[relative_column_18]
-  mutant.loadings.fixed[relative_column_18] <- temp
+  # Get number of analyses (all combined + each component) from pheno_diff which contains the per-landmark shape difference between -3 and +3 standard deviations from the population mean on each component
+  num_of_analyses <- nrow(pheno_diff)
 
-  # Swapping relative columns 48 and 49
-  relative_column_48 <- c(48*3-2, 48*3-1, 48*3)  # Indices for landmark 48
-  relative_column_49 <- c(49*3-2, 49*3-1, 49*3)  # Indices for landmark 49
-  # Swap the values using vector indexing
-  temp <- mutant.loadings.fixed[relative_column_48]
-  mutant.loadings.fixed[relative_column_48] <- mutant.loadings.fixed[relative_column_49]
-  mutant.loadings.fixed[relative_column_49] <- temp
-  
-  # Performing correlation test between MGP phenotype loadings and mutant loadings
-  mutant.cor <- cor.test(as.numeric(MGP_pheno_loadings), mutant.loadings.fixed)
-  
-  # Mean shape
-  mean.shape = row2array3d(colMeans(Y), Nlandmarks = ncol(Y)/3)
-  
-  # Mean mutant shape
-  mutant.shape <- apply(tmp.mutant.registration[, ,(nrow(Y)+1):dim(tmp.mutant.registration)[3]], c(1, 2), mean)
+  # create empty list to store results
+  all_results <- vector("list", length = num_of_analyses)
 
-  # Creating new copy of mutant.shape called mutant.shape.fixed
-  mutant.shape.fixed <- mutant.shape
-  mean.shape.fixed <- mean.shape
+  # Get the equivalent pheno group
+  if (!pheno %in% names(pheno_names_mouse_groups_mutants_equivalences)) {
+    stop(paste0("Unknown phenotype '", pheno, "'. Not found in equivalences."))
+  }
+  pheno <- pheno_names_mouse_groups_mutants_equivalences[[pheno]]
 
-  # Swapping rows 17 and 18
-  mutant.shape.fixed[c(17, 18), ] <- mutant.shape[c(18, 17), ]
-  mean.shape.fixed[c(17, 18), ] <- mean.shape[c(18, 17), ]
+  # iterate over components
+  for(k in 1:num_of_analyses){ 
+    
+    # Parse the pheno_index parameter to determine landmark range
+    pheno_index_range <- eval(parse(text = pheno_index))
+    num_landmarks <- length(pheno_index_range)
+    
+    # Convert landmark indices to column indices (each landmark has x,y,z coordinates)
+    # For landmarks 1:54, we need columns 1:162 (54 landmarks * 3 coordinates each)
+    coord_indices <- as.vector(sapply(pheno_index_range, function(lm) c(lm*3-2, lm*3-1, lm*3)))
+    
+    # Determine phenotype group (Manual vs Automated) using the lookup table
+    pheno_group <- NULL
+    if(!is.null(pheno_names_mouse_groups_mutants$Manual) && pheno %in% pheno_names_mouse_groups_mutants$Manual) {
+      pheno_group <- "Manual"
+    } else if(!is.null(pheno_names_mouse_groups_mutants$Automated) && pheno %in% pheno_names_mouse_groups_mutants$Automated) {
+      pheno_group <- "Automated"
+    } else {
+      stop(paste0("Unknown phenotype '", pheno, "'. Not found in `pheno_names_mouse_groups`."))
+    }
 
-  # Swapping rows 48 and 49
-  mutant.shape.fixed[c(48, 49), ] <- mutant.shape[c(49, 48), ]
-  mean.shape.fixed[c(48, 49), ] <- mean.shape[c(49, 48), ]
+    # Phenotype variable name is the same as the string
+    if(pheno %in% pheno_names_mouse_groups_mutants[pheno_group]) stop(paste0("Phenotype variable '", pheno, "' not found in environment"))
+    # pheno_data <- get(pheno, inherits = TRUE)
+    
+    # Determine which mutant DB / mutant LMS variables to use for this group
+    mutant_vars <- pheno_names_mouse_mutants[[pheno_group]]
+    if(length(mutant_vars) < 2) stop("pheno_names_mouse_mutants must contain two entries per group (db, lms)")
+    mutant_db_name  <- mutant_vars[1]
+    mutant_lms_name <- mutant_vars[2]
+    
+    if(!exists(mutant_db_name, inherits = TRUE)) stop(paste0("Mutant DB '", mutant_db_name, "' not found"))
+    if(!exists(mutant_lms_name, inherits = TRUE)) stop(paste0("Mutant LMS '", mutant_lms_name, "' not found"))
+    
+    mutant_db_all  <- get(mutant_db_name, inherits = TRUE)
+    mutant_lms_all <- get(mutant_lms_name, inherits = TRUE)
+    
+    # select specific landmark set
+    if(pheno_group == "Automated"){
+      mutant_lms_all <- mutant_lms_all[[pheno]]
+      alignment = auto.alignment
+    } else {alignment = manual.alignment}
+    
+    # Convert matrix to vector
+    alignment <- as.numeric(t(alignment))[coord_indices]
+    
+    # Subset by coordinate indices
+    mutant_data <- as.matrix(mutant_lms_all[, coord_indices])
+    
+    # If group is manual then swap certain landmarks
+    if(pheno_group == "Manual"){
+      # Creating new copy of mutant.lms called mutant.lms.fixed
+      mutant_data_fixed <- mutant_data
+      
+      # Swapping relative columns 17 and 18 (each landmark has x,y,z coordinates)
+      relative_column_17 <- c(17*3-2, 17*3-1, 17*3)  # Indices for landmark 17
+      relative_column_18 <- c(18*3-2, 18*3-1, 18*3)  # Indices for landmark 18
+      # Swap the values using vector indexing
+      temp <- mutant_data_fixed[relative_column_17]
+      mutant_data_fixed[relative_column_17] <- mutant_data_fixed[relative_column_18]
+      mutant_data_fixed[relative_column_18] <- temp
+      
+      # Swapping relative columns 48 and 49
+      relative_column_48 <- c(48*3-2, 48*3-1, 48*3)  # Indices for landmark 48
+      relative_column_49 <- c(49*3-2, 49*3-1, 49*3)  # Indices for landmark 49
+      # Swap the values using vector indexing
+      temp <- mutant_data_fixed[relative_column_48]
+      mutant_data_fixed[relative_column_48] <- mutant_data_fixed[relative_column_49]
+      mutant_data_fixed[relative_column_49] <- temp
+      
+      # Replace mutant_data with this fixed stuff
+      mutant_data <- mutant_data_fixed; rm(mutant_data_fixed, temp)
+    }
+    
+    #### START: CREATE AXIS BETWEEN CONTROL AND AXIS ####
+    
+    # Set up table to return
+    mutant_list <- unique(na.omit(mutant_db_all$Gene))
+    
+    # generate labels
+    genotype <- c()
+    for (i in 1:length(mutant_list)){
+      genotype <- c(genotype, unique(na.omit(mutant_db_all$Genotype[mutant_db_all$Gene == mutant_list[i] & mutant_db_all$Experimental_Group == "mutant"]))[1])}
+    
+    mutant_correlations <- data.frame(
+      Gene = mutant_list,
+      Genotype = genotype,
+      Correlation = NA,
+      Cosine_similarity = NA
+    ); rownames(mutant_correlations) <- mutant_correlations$Gene
+    mutant_shapes_fixed <- list()
+    mutant_val <- 0
+    
+    for (j in 1:length(mutant_list)){
+      remove_mutant <- F
+      # specific group meta
+      jmutant <- mutant_db_all[!is.na(mutant_db_all$Gene) & mutant_db_all$Gene == mutant_list[j],]
+      
+      # Check controls and mutants sample sizes
+      control_shape <- na.omit(jmutant$Biosample[jmutant$Experimental_Group == "control"])
+      mutant_shape <- na.omit(jmutant$Biosample[jmutant$Experimental_Group == "mutant"])
+      
+      # Controls first
+      if(length(control_shape) < 3){
+        # match based on strain, experimental group
+        possible_controls <- mutant_db_all[mutant_db_all$Strain %in% jmutant$Strain &
+                                            mutant_db_all$Zygosity == "wild" & 
+                                            !is.na(mutant_db_all$Zygosity),]
+        control_shape <- unique(c(control_shape, possible_controls$Biosample))
+        
+        # Check if there are enough controls now
+        if(length(control_shape) < 3){
+          cat("\nNo suitable controls for",mutant_list[j])
+          remove_mutant <- T
+        }
+      }
+      
+      # Check if mutants exist
+      if(length(mutant_shape) == 0){
+        cat("\nNo mutants for ", mutant_list[j])
+        remove_mutant <- T
+      }
+      
+      # Continue analysis, only if both mutant and controls exist  
+      if(length(control_shape) >= 3 && length(mutant_shape) >= 3){
+        
+        # Remove any NAs
+        control_shape <- na.omit(control_shape)
+        mutant_shape <- na.omit(mutant_shape)
+        
+        # If groups are wildly unbalanced, then sample the controls
+        if (length(mutant_shape)/length(control_shape) < 0.5){
+          control_shape <- sample(control_shape, size = length(mutant_shape))}
+        
+        # Test for group differences
+        test_gdf <- geomorph::geomorph.data.frame(
+          shape = mutant_data[c(control_shape, mutant_shape),],
+          group = c(rep(0, length(control_shape)),rep(1, length(mutant_shape)))  # set 0 to control, 1 to mutant
+        )
+        
+        test_means <- geomorph::procD.lm(shape ~ group, data = test_gdf, iter = 1000, RRPP = TRUE)
+        if(test_means$aov.table$`Pr(>F)`[1] > 0.2){
+          remove_mutant <- T
+        } else {
+          # Calculate axes
+          axis <- test_means$coefficients["group",]
+          
+          # Calculate phenotypic similarity via cosine similarity or correlation
+          mutant_correlations[mutant_list[j],"Cosine_similarity"] <- cos(angle.calc(pheno_diff[k,], axis))
+          mutant_correlations[mutant_list[j],"Correlation"] <- cor(pheno_diff[k,], axis)
+          
+          # save landmarks if max cor shape
+          if(is.null(mutant)){
+            if (abs(mutant_correlations[mutant_list[j],"Correlation"]) > abs(mutant_val)){
+              mutant_val <- mutant_correlations[mutant_list[j],"Correlation"]
+              mutant_shapes_fixed[["min"]] <- alignment - axis
+              mutant_shapes_fixed[["max"]] <- alignment + axis
+            }
+          } else if(mutant == mutant_list[j]){ # or if provided mutant
+            mutant_shapes_fixed[["min"]] <- alignment - axis
+            mutant_shapes_fixed[["max"]] <- alignment + axis
+          }
 
-  # Returning the correlation result
+        }
+      }
+      if(remove_mutant){mutant_correlations <- mutant_correlations[setdiff(rownames(mutant_correlations), mutant_list[j]),]}
+    }; rm(jmutant, test_means, test_gdf, possible_controls, control_shape, mutant_shape)
 
-  return(list(correlation=as.numeric(mutant.cor$estimate), p_value=mutant.cor$p.value, ci=mutant.cor$conf.int, mean=mean.shape.fixed, mutant=mutant.shape.fixed))
+    
+    # Convert mutant_shapes_fixed vectors to 3D arrays before returning
+    if(length(mutant_shapes_fixed) > 0){
+      if(!is.null(mutant_shapes_fixed[["min"]])){
+        mutant_shapes_fixed[["min"]] <- row2array3d(mutant_shapes_fixed[["min"]], Nlandmarks = num_landmarks)
+      }
+      if(!is.null(mutant_shapes_fixed[["max"]])){
+        mutant_shapes_fixed[["max"]] <- row2array3d(mutant_shapes_fixed[["max"]], Nlandmarks = num_landmarks)
+      }
+    }
 
+    # Return correlations and landmarks for shapes
+    all_results[[k]] <- list(correlation = mutant_correlations, mutant_shapes = mutant_shapes_fixed)
+  }
+
+  print(all_results)
+
+  return(all_results)
 }
-
-
