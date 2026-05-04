@@ -4,6 +4,9 @@ This repository contains a Plumber API for performing Morph-Genetic-Profiling (M
 
 This API implements the `ddsPLS` (discriminant and de-sparsified PLS) method to find associations between genotype and phenotype. It provides endpoints for running analyses based on Gene Ontology (GO) terms or custom gene lists, for both Diversity Outbred (DO) mouse skull data and human facial data.
 
+To test it with our web GUI go to [Hallgrimsson Lab MGP](https://hallgrimssonlab.ca/MGPShow)
+
+
 ## 1. Setup & Dependencies
 
 ### R Packages
